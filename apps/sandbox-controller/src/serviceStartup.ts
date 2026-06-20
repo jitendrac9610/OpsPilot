@@ -1,98 +1,93 @@
-import { spawn, ChildProcess } from "node:child_process";
 import http from "node:http";
 import { prisma } from "@opspilot/database";
 import { logger } from "@opspilot/shared";
+import { ContainerRunner } from "./containerRunner.js";
+import { ServiceCommand } from "./executionManifest.js";
 
 export class ServiceStartupManager {
-  private activeProcesses = new Map<string, ChildProcess[]>();
-  private dbFallback = false;
+  private readonly activeContainers = new Map<string, string[]>();
 
-  constructor(dbFallback = false) {
-    this.dbFallback = dbFallback;
+  constructor(
+    private readonly dbFallback = false,
+    private readonly runner = new ContainerRunner()
+  ) {}
+
+  public getActiveContainers(sandboxId: string): string[] {
+    return this.activeContainers.get(sandboxId) || [];
   }
 
-  public getActiveProcesses(sandboxId: string): ChildProcess[] {
-    return this.activeProcesses.get(sandboxId) || [];
+  public clearContainers(sandboxId: string) {
+    this.activeContainers.delete(sandboxId);
   }
 
-  public clearProcesses(sandboxId: string) {
-    this.activeProcesses.delete(sandboxId);
+  public async stopAll(sandboxId: string) {
+    const containers = this.getActiveContainers(sandboxId);
+    await Promise.all(containers.map((containerId) => this.runner.stop(containerId)));
+    this.clearContainers(sandboxId);
   }
 
   public async startService(
     sandboxId: string,
     workspaceDir: string,
-    name: string,
-    command: string,
-    args: string[] = [],
-    port?: number
-  ): Promise<{ success: boolean; pid?: number }> {
-    logger.info({ sandboxId, name, command, args }, "Starting sandbox background service");
+    service: ServiceCommand,
+    environment: Record<string, string> = {}
+  ): Promise<{ success: boolean; containerId?: string; log: string }> {
+    logger.info({ sandboxId, service }, "Starting discovered service in isolated container");
+    const result = await this.runner.startDetached({
+      sandboxId,
+      workspaceDir,
+      command: service.command,
+      environment,
+      allowNetwork: true,
+      ports: service.port ? [service.port] : []
+    });
 
-    try {
-      // For cross-platform compatibility, run node script if it's start or npm start
-      // Note: Child processes are launched using spawn.
-      const child = spawn(command, args, {
-        cwd: workspaceDir,
-        shell: true,
-        stdio: "pipe"
-      });
-
-      if (!this.activeProcesses.has(sandboxId)) {
-        this.activeProcesses.set(sandboxId, []);
-      }
-      this.activeProcesses.get(sandboxId)!.push(child);
-
-      child.stdout?.on("data", (data) => {
-        logger.debug({ service: name, output: data.toString().trim() }, "Service stdout");
-      });
-      child.stderr?.on("data", (data) => {
-        logger.warn({ service: name, output: data.toString().trim() }, "Service stderr");
-      });
-
-      // Health readiness check: in unit tests, port can be simulated or checked
-      let isHealthy = true;
-      if (port) {
-        isHealthy = await this.waitForPort(port, 5); // 5 attempts
-      }
-
-      const status = isHealthy ? "RUNNING" : "UNHEALTHY";
-
-      if (!this.dbFallback) {
-        try {
-          await prisma.sandboxService.create({
-            data: {
-              sandboxId,
-              name,
-              port: port || 0,
-              status
-            }
-          });
-        } catch (err: any) {
-          logger.warn({ err }, "Failed to write SandboxService entry to database");
-        }
-      }
-
-      return { success: isHealthy, pid: child.pid };
-    } catch (err: any) {
-      logger.error({ err, name }, "Failed to start service process");
-      return { success: false };
+    let healthy = result.success;
+    if (healthy && service.port) {
+      healthy = await this.waitForPort(service.port, 20);
     }
+    if (!healthy && result.containerId) {
+      await this.runner.stop(result.containerId);
+    }
+
+    if (healthy && result.containerId) {
+      const current = this.activeContainers.get(sandboxId) || [];
+      current.push(result.containerId);
+      this.activeContainers.set(sandboxId, current);
+    }
+
+    if (!this.dbFallback) {
+      try {
+        await prisma.sandboxService.create({
+          data: {
+            sandboxId,
+            name: service.name,
+            port: service.port || 0,
+            status: healthy ? "RUNNING" : "UNHEALTHY"
+          }
+        });
+      } catch (error) {
+        logger.warn({ error }, "Failed to persist SandboxService");
+      }
+    }
+
+    return {
+      success: healthy,
+      containerId: healthy ? result.containerId : undefined,
+      log: healthy ? result.log : `${result.log}\nSERVICE_READINESS_FAILED`
+    };
   }
 
   private async waitForPort(port: number, maxAttempts: number): Promise<boolean> {
-    logger.info({ port }, "Waiting for service port to be active");
-    for (let i = 0; i < maxAttempts; i++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const active = await new Promise<boolean>((resolve) => {
-        const req = http.get(`http://localhost:${port}/`, (res) => {
-          resolve(true);
-        });
-        req.on("error", () => {
+        const request = http.get({ hostname: "127.0.0.1", port, path: "/", timeout: 1000 }, () => resolve(true));
+        request.on("error", () => resolve(false));
+        request.on("timeout", () => {
+          request.destroy();
           resolve(false);
         });
-        req.end();
       });
-
       if (active) return true;
       await new Promise((resolve) => setTimeout(resolve, 500));
     }

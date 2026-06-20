@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import unzipper from "unzipper";
-import { logger, storage, EventBus, generateId, generateCorrelationId, generateIdempotencyKey, OpsPilotError } from "@opspilot/shared";
+import { config, logger, storage, EventBus, generateId, generateCorrelationId, generateIdempotencyKey, OpsPilotError } from "@opspilot/shared";
 import { prisma } from "@opspilot/database";
 import { classifyFile, shouldExcludeFile, parseFile, ExtractedSymbol, runStaticAnalysis } from "@opspilot/repository-intelligence";
 import { getEmbedding } from "@opspilot/rag";
@@ -55,7 +55,7 @@ app.post("/index", async (req: Request, res: Response, next: NextFunction) => {
     return res.status(400).json({ error: "VALIDATION_ERROR", message: "repositoryId, commitSha, and archiveUrl are required" });
   }
 
-  const tempUnzipDir = path.join("c:\\Users\\jiten\\OpsPilot", "sandbox", "temp", `index_${generateId()}`);
+  const tempUnzipDir = path.join(config.tempRoot, `index_${generateId()}`);
   logger.info({ repositoryId, commitSha, archiveUrl }, "Starting repository indexing execution");
 
   try {
@@ -63,7 +63,9 @@ app.post("/index", async (req: Request, res: Response, next: NextFunction) => {
     const oldLogs = await prisma.auditLog.findMany({
       where: { action: "repository.index.log" }
     });
-    const idsToDelete = oldLogs.filter(l => (l.payload as any)?.repositoryId === repositoryId).map(l => l.id);
+    const idsToDelete = oldLogs
+      .filter((log: { payload: unknown }) => (log.payload as any)?.repositoryId === repositoryId)
+      .map((log: { id: string }) => log.id);
     if (idsToDelete.length > 0) {
       await prisma.auditLog.deleteMany({
         where: { id: { in: idsToDelete } }
@@ -102,6 +104,20 @@ app.post("/index", async (req: Request, res: Response, next: NextFunction) => {
     // 5. Extract ZIP
     fs.mkdirSync(tempUnzipDir, { recursive: true });
     const directory = await unzipper.Open.buffer(zipBuffer);
+    if (directory.files.length > config.sandbox.maxArchiveFiles) {
+      throw new Error(`Snapshot contains too many files (${directory.files.length})`);
+    }
+    for (const entry of directory.files) {
+      const normalized = path.posix.normalize(entry.path.replace(/\\/g, "/"));
+      if (
+        normalized.startsWith("/") ||
+        normalized === ".." ||
+        normalized.startsWith("../") ||
+        /^[a-zA-Z]:/.test(normalized)
+      ) {
+        throw new Error(`Unsafe snapshot archive path: ${entry.path}`);
+      }
+    }
     await directory.extract({ path: tempUnzipDir });
 
     // 6. Scan files recursively
@@ -118,7 +134,7 @@ app.post("/index", async (req: Request, res: Response, next: NextFunction) => {
     const otherSnapshots = await prisma.repositorySnapshot.findMany({
       where: { repositoryId }
     });
-    const snapshotIds = otherSnapshots.map(s => s.id);
+    const snapshotIds = otherSnapshots.map((candidate: { id: string }) => candidate.id);
 
     await logProgress(repositoryId, "Running Universal Stack Discovery & parsing source files using AST compiler...");
 
@@ -131,8 +147,18 @@ app.post("/index", async (req: Request, res: Response, next: NextFunction) => {
 
         // Check for null bytes in the file content (binary or non-UTF-8 detection)
         const fileContent = fs.readFileSync(absolutePath);
+        if (fileContent.byteLength > config.sandbox.maxFileBytes) {
+          logger.warn({ relativePath, size: fileContent.byteLength }, "Skipping file above indexing size limit");
+          continue;
+        }
         if (fileContent.includes(0)) {
           logger.warn({ relativePath }, "Skipping file containing null bytes (likely binary or non-UTF-8)");
+          continue;
+        }
+        try {
+          new TextDecoder("utf-8", { fatal: true }).decode(fileContent);
+        } catch {
+          logger.warn({ relativePath }, "Skipping file that is not valid UTF-8");
           continue;
         }
 
@@ -270,7 +296,7 @@ app.post("/index", async (req: Request, res: Response, next: NextFunction) => {
     // 8. Trigger Graph Worker
     await logProgress(repositoryId, "Building evidence-backed architecture graph...");
     
-    const graphResponse = await fetch("http://localhost:4004/graph", {
+    const graphResponse = await fetch(`${config.services.graphWorkerUrl}/graph`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

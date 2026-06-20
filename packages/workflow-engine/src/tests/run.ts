@@ -1,4 +1,7 @@
 import assert from "node:assert";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { WorkflowDiscoverer } from "../discovery.js";
 import { WorkflowDrivers } from "../drivers.js";
 import { AssertionEngine } from "../assertions.js";
@@ -6,89 +9,64 @@ import { CorrelationManager } from "../correlation.js";
 import { FailureLocalizer } from "../localization.js";
 
 async function runTests() {
-  console.log("=== Running Workflow Engine Unit Tests ===");
+  const repositoryRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "opspilot-workflow-test-"));
+  await fs.promises.writeFile(
+    path.join(repositoryRoot, "routes.ts"),
+    `router.post("/api/orders", async (_req, res) => res.status(201).json({ ok: true }));`
+  );
 
-  const wd = new WorkflowDiscoverer(true);
-  const dr = new WorkflowDrivers();
-  const ae = new AssertionEngine(true);
-  const cm = new CorrelationManager(true);
-  const fl = new FailureLocalizer(true);
+  const discoverer = new WorkflowDiscoverer(true);
+  const discovered = await discoverer.discover("proj-123", repositoryRoot);
+  assert.strictEqual(discovered.length, 1);
+  assert.strictEqual(discovered[0].steps[0].config.url, "/api/orders");
 
-  console.log("\n1. Testing Workflow Discovery...");
-  {
-    const discovered = await wd.discover("proj-123", "/mock/repo/dir");
-    assert(discovered.length >= 2);
-    assert.strictEqual(discovered[0].name, "Create and join interview");
-    assert.strictEqual(discovered[1].name, "Stripe Webhook Invoice Process");
-    console.log("✓ Workflows discovered successfully.");
-  }
+  const drivers = new WorkflowDrivers("http://localhost:4000", {
+    execute: async (_config, correlationId) => ({
+      success: true,
+      log: `Playwright fixture completed [correlationId=${correlationId}]`
+    })
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 201,
+    text: async () => JSON.stringify({ success: true })
+  } as Response);
+  const httpResult = await drivers.executeHTTPStep({
+    method: "POST",
+    url: "/api/orders",
+    expectedStatus: 201
+  });
+  assert.strictEqual(httpResult.success, true);
+  assert(httpResult.correlationId);
+  globalThis.fetch = originalFetch;
 
-  console.log("\n2. Testing HTTP/Browser Drivers...");
-  {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => {
-      return {
-        ok: true,
-        status: 201,
-        text: async () => JSON.stringify({ success: true })
-      } as Response;
-    };
+  const browserResult = await drivers.executeBrowserStep({ action: "navigate", url: "/orders" });
+  assert.strictEqual(browserResult.success, true);
 
-    const httpRes = await dr.executeHTTPStep({
-      method: "POST",
-      url: "/api/interviews",
-      payload: { candidate: "Alice" }
-    });
-    assert.strictEqual(httpRes.success, true);
-    assert.strictEqual(httpRes.status, 201);
-    assert(httpRes.log.includes("completed"));
+  const assertions = new AssertionEngine({
+    database: async () => ({ success: true, log: "database fixture" }),
+    queue: async () => ({ success: true, log: "queue fixture" }),
+    sdk: async () => ({ success: true, log: "sdk fixture" })
+  });
+  assert.strictEqual((await assertions.assertDBState({ query: "SELECT 1" })).success, true);
+  assert.strictEqual((await assertions.assertQueueEvent({ event: "order.created" })).success, true);
+  assert.strictEqual((await assertions.assertSDKState({ sdk: "Stripe", action: "invoice_exists" })).success, true);
 
-    globalThis.fetch = originalFetch;
+  const correlation = new CorrelationManager(true);
+  const runId = await correlation.startWorkflowRun("wf-123");
+  await correlation.recordStepRun(runId, "step-1", "COMPLETED", ["passed"]);
+  await correlation.completeWorkflowRun(runId, "COMPLETED");
 
-    const browserRes = await dr.executeBrowserStep({
-      action: "navigate",
-      url: "/interviews/room"
-    });
-    assert.strictEqual(browserRes.success, true);
-    assert(browserRes.log.includes("navigated to URL"));
+  const localizer = new FailureLocalizer(true);
+  const boundaryId = await localizer.localizeFailure(runId, "POST /api/orders", "HTTP 500");
+  assert(boundaryId.startsWith("fb-"));
 
-    console.log("✓ HTTP/Browser driver executions passed.");
-  }
-
-  console.log("\n3. Testing Assertion Engine...");
-  {
-    const dbAssert = await ae.assertDBState({ query: "db.interviews.findOne({ candidate: 'Alice' })" });
-    assert.strictEqual(dbAssert.success, true);
-
-    const queueAssert = await ae.assertQueueEvent({ event: "interview.created" });
-    assert.strictEqual(queueAssert.success, true);
-
-    const sdkAssert = await ae.assertSDKState({ sdk: "GetStream", action: "room_exists" });
-    assert.strictEqual(sdkAssert.success, true);
-    console.log("✓ Multi-dimensional assertions passed.");
-  }
-
-  console.log("\n4. Testing Correlation and Logging...");
-  {
-    const runId = await cm.startWorkflowRun("wf-123");
-    assert(runId.startsWith("wfrun-"));
-
-    await cm.recordStepRun(runId, "step-1", "COMPLETED", ["Step 1 started", "Step 1 passed"]);
-    await cm.completeWorkflowRun(runId, "COMPLETED");
-    console.log("✓ Correlation tracking completed.");
-  }
-
-  console.log("\n5. Testing Failure Localization...");
-  {
-    const boundaryId = await fl.localizeFailure("wfrun-123", "Verify GetStream room", "Room not found on GetStream servers");
-    assert(boundaryId.startsWith("fb-"));
-    console.log("✓ Failure localized and recorded.");
-  }
-
-  console.log("\nALL WORKFLOW ENGINE TESTS PASSED SUCCESSFULLY!");
+  await fs.promises.rm(repositoryRoot, { recursive: true, force: true });
+  console.log("ALL WORKFLOW ENGINE TESTS PASSED");
 }
 
-runTests().catch((err) => {
-  console.error("\nTEST RUN FAILED:", err);
+runTests().catch((error) => {
+  console.error("TEST RUN FAILED:", error);
   process.exit(1);
 });

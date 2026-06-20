@@ -97,6 +97,12 @@ async function runTests() {
   console.log("\n5. Testing Tool Registry...");
   {
     const tr = new ToolRegistry();
+    tr.register({
+      name: "view_logs",
+      description: "Test fixture log adapter",
+      parameters: {},
+      handler: async () => "Failed to connect to database"
+    });
     const list = tr.listTools();
     assert(list.length > 0);
     assert(tr.getTool("view_logs") !== undefined);
@@ -156,7 +162,19 @@ async function runTests() {
       { type: "call_tool", tool: "run_tests", arguments: {} }, 
       { type: "propose_change", plan: { file: "config.json" } }, 
       { type: "call_tool", tool: "apply_patch", arguments: { file: "config.json", patch: "foo" } }, 
-      { type: "request_approval", approval: { id: "appr-1" } }, 
+      {
+        type: "request_approval",
+        approval: {
+          id: "appr-1",
+          verification: {
+            originalFailureReproduced: true,
+            buildPassed: true,
+            workflowPassed: true,
+            regressionTestsPassedCount: 3,
+            securityRegressionDetected: false
+          }
+        }
+      },
       { type: "call_tool", tool: "approve_action", arguments: { id: "appr-1" } }, 
       { type: "call_tool", tool: "apply_approved_changes", arguments: {} }, 
       { type: "complete", conclusion: { summary: "Database connection variable fixed." } } 
@@ -164,6 +182,22 @@ async function runTests() {
 
     orchestrator.modelGateway.setMockDecisions(mockDecisions);
     orchestrator.addApprovedActionId("appr-1");
+    for (const name of [
+      "list_services",
+      "index_repository",
+      "view_logs",
+      "run_tests",
+      "apply_patch",
+      "approve_action",
+      "apply_approved_changes"
+    ]) {
+      orchestrator.toolRegistry.register({
+        name,
+        description: `Explicit test adapter for ${name}`,
+        parameters: {},
+        handler: async (args) => ({ fixture: true, name, args })
+      });
+    }
 
     const finalState = await orchestrator.run();
     assert.strictEqual(finalState, "COMPLETED");

@@ -4,15 +4,28 @@ import { ChangeSetManager } from "../changesets.js";
 import { WorkflowReplayer } from "../replay.js";
 import { VerificationGates } from "../gates.js";
 import { AlternativeRepairLoop } from "../loop.js";
+import { WorkflowDrivers } from "@opspilot/workflow-engine";
 
 async function runTests() {
   console.log("=== Running Remediation Engine Unit Tests ===");
 
   const pm = new RemediationPlanManager(true);
   const cm = new ChangeSetManager(true);
-  const wr = new WorkflowReplayer();
+  const wr = new WorkflowReplayer(new WorkflowDrivers("http://localhost:4000", {
+    execute: async () => ({ success: true, log: "Playwright fixture completed" })
+  }));
   const vg = new VerificationGates(true);
-  const ar = new AlternativeRepairLoop();
+  const ar = new AlternativeRepairLoop({
+    execute: async (_plan, attempt) => ({
+      patchApplied: true,
+      changedFiles: ["src/config.ts"],
+      buildSuccess: true,
+      testSuccess: attempt > 1,
+      replaySuccess: attempt > 1,
+      securitySuccess: true,
+      logs: [`Executed real verification fixture for attempt ${attempt}`]
+    })
+  });
 
   const diagnosisId = "diag-123";
 
@@ -78,7 +91,7 @@ async function runTests() {
   );
   assert.strictEqual(loopRes.success, true);
   assert.strictEqual(loopRes.attemptCount, 2); 
-  assert.strictEqual(loopRes.finalLogs.length, 4);
+  assert.strictEqual(loopRes.finalLogs.length, 6);
   console.log("✓ Repair loop completed successfully.");
 
   console.log("\nALL REMEDIATION ENGINE TESTS PASSED SUCCESSFULLY!");

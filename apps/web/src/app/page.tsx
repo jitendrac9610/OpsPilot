@@ -4,6 +4,8 @@ import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Terminal, Shield, Cpu, Activity, ArrowRight, Github } from "lucide-react";
 
+const API_BASE_URL = process.env.NEXT_PUBLIC_CONTROL_API_URL || "http://localhost:4000";
+
 export default function LandingPage() {
   const router = useRouter();
   const [isLogin, setIsLogin] = useState(true);
@@ -19,7 +21,7 @@ export default function LandingPage() {
 
     const endpoint = isLogin ? "/api/auth/login" : "/api/auth/register";
     try {
-      const res = await fetch(`http://localhost:4000${endpoint}`, {
+      const res = await fetch(`${API_BASE_URL}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password })

@@ -1,10 +1,11 @@
 import fs from "fs";
 import path from "path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 
 export class ObjectStorage {
-  private static localUploadDir = path.join("c:\\Users\\jiten\\OpsPilot", "sandbox", "temp", "uploads");
+  private static localUploadDir = config.snapshotStorageRoot;
 
   constructor() {
     // Ensure local directory exists for fallback local disk writes
@@ -24,28 +25,22 @@ export class ObjectStorage {
       try {
         await fs.promises.writeFile(localPath, buffer);
         logger.info({ filename, localPath }, "Uploaded snapshot archive to local storage fallback");
-        return `file://${localPath}`;
+        return pathToFileURL(localPath).toString();
       } catch (err) {
         logger.error({ err, filename }, "Failed to write local snapshot file");
         throw err;
       }
     }
 
-    // Standard MinIO / S3 REST upload flow (Simulated for this workspace)
-    try {
-      const url = `http://${endpoint}:${config.minio.port}/${bucket}/${filename}`;
-      logger.info({ filename, url }, "Uploaded snapshot to MinIO bucket");
-      return url;
-    } catch (err) {
-      logger.error({ err, filename }, "MinIO upload failure");
-      throw err;
-    }
+    throw new Error(
+      `OBJECT_STORAGE_UPLOAD_NOT_CONFIGURED: Direct upload to ${endpoint}:${config.minio.port}/${bucket} requires a real S3/MinIO client.`
+    );
   }
 
   // Downloads a snapshot archive file to buffer
   async downloadSnapshot(fileUrl: string): Promise<Buffer> {
     if (fileUrl.startsWith("file://")) {
-      const localPath = fileUrl.replace("file://", "");
+      const localPath = fileURLToPath(fileUrl);
       return await fs.promises.readFile(localPath);
     }
 

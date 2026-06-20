@@ -30,10 +30,10 @@ export class ToolRegistry {
     logger.info({ name, args }, "Executing tool...");
     const tool = this.tools.get(name);
     if (!tool) {
-      logger.warn({ name }, "Tool not found in registry. Running mock fallback.");
+      logger.warn({ name }, "Tool not found in registry");
       return {
-        success: true,
-        output: { message: `Mock execution fallback for tool ${name}`, args }
+        success: false,
+        output: { error: "TOOL_NOT_REGISTERED", tool: name }
       };
     }
 
@@ -52,7 +52,7 @@ export class ToolRegistry {
       name: "list_files",
       description: "Lists all files in the current repository workspace",
       parameters: {},
-      handler: async () => ["package.json", "src/index.ts", "config.json"]
+      handler: async () => this.notConfigured("list_files")
     });
 
     this.register({
@@ -63,7 +63,7 @@ export class ToolRegistry {
         properties: { path: { type: "string" } },
         required: ["path"]
       },
-      handler: async (args) => `Mock content for file ${args.path}`
+      handler: async () => this.notConfigured("view_file")
     });
 
     // 2. Static Analysis Tools
@@ -71,7 +71,7 @@ export class ToolRegistry {
       name: "run_static_analysis",
       description: "Runs static analysis to detect code issues and failures",
       parameters: {},
-      handler: async () => [{ file: "config.json", message: "Potential hardcoded credentials", type: "CRITICAL" }]
+      handler: async () => this.notConfigured("run_static_analysis")
     });
 
     // 3. Runtime Tools
@@ -79,10 +79,7 @@ export class ToolRegistry {
       name: "list_services",
       description: "Lists all running services in the current environment",
       parameters: {},
-      handler: async () => [
-        { name: "api-service", status: "running", port: 3000 },
-        { name: "auth-service", status: "failed", port: 3001 }
-      ]
+      handler: async () => this.notConfigured("list_services")
     });
 
     this.register({
@@ -93,7 +90,7 @@ export class ToolRegistry {
         properties: { service: { type: "string" } },
         required: ["service"]
       },
-      handler: async (args) => `2026-06-19T00:56:52Z [ERROR] Failed to connect to database at localhost:5432`
+      handler: async () => this.notConfigured("view_logs")
     });
 
     // 4. Workflow Tools
@@ -104,7 +101,7 @@ export class ToolRegistry {
         type: "object",
         properties: { suite: { type: "string" } }
       },
-      handler: async (args) => ({ passed: true, log: "Tests run: 5, Passed: 5, Failed: 0" })
+      handler: async () => this.notConfigured("run_tests")
     });
 
     // 5. Modification Tools
@@ -119,7 +116,7 @@ export class ToolRegistry {
         },
         required: ["file", "patch"]
       },
-      handler: async (args) => ({ success: true, file: args.file })
+      handler: async () => this.notConfigured("apply_patch")
     });
 
     // 6. Approved Production Tools
@@ -131,7 +128,7 @@ export class ToolRegistry {
         properties: { service: { type: "string" } },
         required: ["service"]
       },
-      handler: async (args) => ({ status: "restarting", service: args.service })
+      handler: async () => this.notConfigured("restart_service")
     });
 
     this.register({
@@ -142,7 +139,7 @@ export class ToolRegistry {
         properties: { deploymentId: { type: "string" } },
         required: ["deploymentId"]
       },
-      handler: async (args) => ({ status: "rolled_back", deploymentId: args.deploymentId })
+      handler: async () => this.notConfigured("rollback_deployment")
     });
 
     // Other tools can be dynamically registered
@@ -154,14 +151,18 @@ export class ToolRegistry {
         properties: { id: { type: "string" } },
         required: ["id"]
       },
-      handler: async (args) => ({ success: true, id: args.id })
+      handler: async () => this.notConfigured("approve_action")
     });
 
     this.register({
       name: "apply_approved_changes",
       description: "Applies approved changes to the environment",
       parameters: {},
-      handler: async () => ({ success: true })
+      handler: async () => this.notConfigured("apply_approved_changes")
     });
+  }
+
+  private notConfigured(name: string): never {
+    throw new Error(`TOOL_NOT_CONFIGURED: ${name} requires a real runtime adapter.`);
   }
 }

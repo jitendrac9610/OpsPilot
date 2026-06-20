@@ -49,7 +49,7 @@ export class AgentOrchestrator {
     this.agentRunId = config.agentRunId || `run-${Math.random().toString(36).substring(2, 9)}`;
     this.workflowRunId = config.workflowRunId || `wf-${Math.random().toString(36).substring(2, 9)}`;
     this.incidentId = config.incidentId || `inc-${Math.random().toString(36).substring(2, 9)}`;
-    this.snapshotId = config.snapshotId || `snap-${Math.random().toString(36).substring(2, 9)}`;
+    this.snapshotId = config.snapshotId || "";
     this.goal = config.goal;
 
     this.stateMachine = new AgentStateMachine("CREATED");
@@ -111,18 +111,22 @@ export class AgentOrchestrator {
     // 1. Gather context via RAG
     this.budget.recordRetrieval();
     let contextText = `Incident Resolution Goal: ${this.goal}\n`;
-    try {
-      const ragCtx = await this.rag.retrieveHybridContext(this.goal, {
-        snapshotId: this.snapshotId,
-        agentRunId: this.agentRunId,
-        workflowRunId: this.workflowRunId,
-        incidentId: this.incidentId,
-        skipRewrite: true
-      });
-      contextText += ragCtx.fullContextText;
-    } catch (err: any) {
-      logger.warn({ err }, "RAG retrieval failed, continuing with goal context.");
-      contextText += `\n(RAG system offline. Falling back to default database schema knowledge.)`;
+    if (!this.snapshotId) {
+      contextText += "\n(NO_REPOSITORY_SNAPSHOT: Code-grounded retrieval is unavailable.)";
+    } else {
+      try {
+        const ragCtx = await this.rag.retrieveHybridContext(this.goal, {
+          snapshotId: this.snapshotId,
+          agentRunId: this.agentRunId,
+          workflowRunId: this.workflowRunId,
+          incidentId: this.incidentId,
+          skipRewrite: true
+        });
+        contextText += ragCtx.fullContextText;
+      } catch (err: any) {
+        logger.warn({ err }, "RAG retrieval failed.");
+        contextText += `\n(RAG_RETRIEVAL_FAILED: No repository context was added.)`;
+      }
     }
 
     // Append memory, planner, hypothesis and evidence information to prompt
@@ -260,6 +264,9 @@ export class AgentOrchestrator {
           "TOOL_EXECUTION",
           { tool, arguments: args, success: toolResult.success, output: toolResult.output }
         );
+        if (!toolResult.success) {
+          throw new Error(`TOOL_EXECUTION_FAILED: ${tool}`);
+        }
         break;
       }
 
@@ -269,6 +276,9 @@ export class AgentOrchestrator {
           const description = update.description || "Root cause hypothesis";
           const confidence = typeof update.confidence === "number" ? update.confidence : 50;
           const status = update.status || "NEUTRAL";
+          if (status === "SUPPORTED" && this.evidenceManager.getEvidence().length === 0) {
+            throw new Error("EVIDENCE_REQUIRED: A hypothesis cannot be SUPPORTED without attached run evidence.");
+          }
 
           // Find existing hypothesis
           const existing = this.hypothesisEngine.getHypotheses().find((h) => h.description === description);
@@ -350,37 +360,84 @@ export class AgentOrchestrator {
 
     switch (currentState) {
       case "CREATED":
-        this.stateMachine.transitionTo("DISCOVERING");
+        this.transitionWhen(
+          decision.type === "call_tool" && decision.tool === "list_services",
+          "DISCOVERING",
+          "Service discovery evidence was not requested."
+        );
         break;
       case "DISCOVERING":
-        this.stateMachine.transitionTo("INDEXING");
+        this.transitionWhen(
+          decision.type === "call_tool" && decision.tool === "index_repository",
+          "INDEXING",
+          "Repository indexing was not executed."
+        );
         break;
       case "INDEXING":
-        this.stateMachine.transitionTo("PLANNING");
+        this.transitionWhen(
+          decision.type === "replan" || decision.type === "retrieve",
+          "PLANNING",
+          "No evidence-based plan was produced from indexing."
+        );
         break;
       case "PLANNING":
-        this.stateMachine.transitionTo("RETRIEVING");
+        this.transitionWhen(
+          decision.type === "retrieve" || decision.type === "replan",
+          "RETRIEVING",
+          "The plan did not request supporting evidence."
+        );
         break;
       case "RETRIEVING":
-        this.stateMachine.transitionTo("INVESTIGATING");
+        this.transitionWhen(
+          decision.type === "call_tool" || decision.type === "retrieve",
+          "INVESTIGATING",
+          "No runtime evidence was retrieved."
+        );
         break;
       case "INVESTIGATING":
-        this.stateMachine.transitionTo("DIAGNOSING");
+        this.transitionWhen(
+          decision.type === "update_hypotheses" && this.evidenceManager.getEvidence().length > 0,
+          "DIAGNOSING",
+          "Diagnosis requires at least one evidence artifact."
+        );
         break;
       case "DIAGNOSING":
-        this.stateMachine.transitionTo("REPRODUCING");
+        this.transitionWhen(
+          decision.type === "call_tool" && decision.tool === "run_tests",
+          "REPRODUCING",
+          "The original failure was not reproduced."
+        );
         break;
       case "REPRODUCING":
-        this.stateMachine.transitionTo("PROPOSING_FIX");
+        this.transitionWhen(
+          decision.type === "propose_change",
+          "PROPOSING_FIX",
+          "No bounded change was proposed."
+        );
         break;
       case "PROPOSING_FIX":
-        this.stateMachine.transitionTo("APPLYING_SANDBOX_CHANGE");
+        this.transitionWhen(
+          decision.type === "call_tool" && decision.tool === "apply_patch",
+          "APPLYING_SANDBOX_CHANGE",
+          "The proposed patch was not applied in the sandbox."
+        );
         break;
-      case "APPLYING_SANDBOX_CHANGE":
-        this.stateMachine.transitionTo("VERIFYING_FIX");
+      case "APPLYING_SANDBOX_CHANGE": {
+        const verified = decision.type === "request_approval" && this.approvalHasVerificationEvidence(decision.approval);
+        if (verified) {
+          this.stateMachine.transitionTo("VERIFYING_FIX");
+          this.stateMachine.transitionTo("AWAITING_APPROVAL");
+        } else {
+          this.transitionToNeedsHuman("Approval was requested without complete verification evidence.");
+        }
         break;
+      }
       case "VERIFYING_FIX":
-        this.stateMachine.transitionTo("AWAITING_APPROVAL");
+        this.transitionWhen(
+          decision.type === "request_approval" && this.approvalHasVerificationEvidence(decision.approval),
+          "AWAITING_APPROVAL",
+          "Build, workflow, regression, and security evidence are required before approval."
+        );
         break;
       case "AWAITING_APPROVAL":
         if (decision.type === "call_tool" && decision.tool === "approve_action") {
@@ -415,6 +472,29 @@ export class AgentOrchestrator {
         logger.warn({ err }, "Failed to update agent run status in database");
       });
     }
+  }
+
+  private transitionWhen(condition: boolean, nextState: AgentState, failureReason: string) {
+    if (condition) {
+      this.stateMachine.transitionTo(nextState);
+    } else {
+      this.transitionToNeedsHuman(failureReason);
+    }
+  }
+
+  private transitionToNeedsHuman(reason: string) {
+    logger.warn({ state: this.stateMachine.getState(), reason }, "Evidence gate blocked agent state transition");
+    this.evidenceManager.setMissingEvidence([reason]);
+    this.stateMachine.transitionTo("NEEDS_HUMAN");
+  }
+
+  private approvalHasVerificationEvidence(approval: any): boolean {
+    const verification = approval?.verification;
+    return verification?.originalFailureReproduced === true &&
+      verification?.buildPassed === true &&
+      verification?.workflowPassed === true &&
+      Number(verification?.regressionTestsPassedCount) > 0 &&
+      verification?.securityRegressionDetected === false;
   }
 
   private async saveCheckpoint() {

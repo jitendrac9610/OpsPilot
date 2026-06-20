@@ -43,6 +43,8 @@ interface AuditLog {
   timestamp: string;
 }
 
+const API_BASE_URL = process.env.NEXT_PUBLIC_CONTROL_API_URL || "http://localhost:4000";
+
 export default function Dashboard() {
   const router = useRouter();
   const [token, setToken] = useState<string | null>(null);
@@ -83,7 +85,7 @@ export default function Dashboard() {
   const [mainView, setMainView] = useState<"quick-scan" | "projects" | "incidents" | "evaluation" | "billing" | "runtime-lab">("quick-scan");
 
   // Quick Scan States
-  const [scanUrl, setScanUrl] = useState("mock_url");
+  const [scanUrl, setScanUrl] = useState("");
   const [scanBranch, setScanBranch] = useState("main");
   const [scanStatus, setScanStatus] = useState<"idle" | "connecting" | "indexing" | "static_checks" | "sandbox_init" | "dynamic_tests" | "completed" | "failed">("idle");
   const [scanProgress, setScanProgress] = useState<string[]>([]);
@@ -102,14 +104,7 @@ export default function Dashboard() {
   const [runningSandboxTest, setRunningSandboxTest] = useState<boolean>(false);
   const [injectingFailure, setInjectingFailure] = useState<boolean>(false);
   const [runningLoadTest, setRunningLoadTest] = useState<boolean>(false);
-  const [sandboxLogs, setSandboxLogs] = useState<string[]>([
-    "🚀 Initializing secure ephemeral sandbox environment...",
-    "📦 Cloned repository snapshot successfully.",
-    "⚙️ Resolving dependency tree and building AST mapping...",
-    "🔌 Starting database adapters (PostgreSQL, Redis, MongoDB)...",
-    "⚡ Bootstrapping service cluster...",
-    "🟢 Runtime Lab is active and ready on isolated virtual ports."
-  ]);
+  const [sandboxLogs, setSandboxLogs] = useState<string[]>([]);
   const [incidents, setIncidents] = useState<any[]>([]);
   const [selectedIncident, setSelectedIncident] = useState<any | null>(null);
   const [incidentTimeline, setIncidentTimeline] = useState<any[]>([]);
@@ -140,16 +135,9 @@ export default function Dashboard() {
   const handleStartRuntimeLab = async (repositoryId: string) => {
     setLoadingSandbox(true);
     setMainView("runtime-lab");
-    setSandboxLogs([
-      "🚀 Initializing secure ephemeral sandbox environment...",
-      "📦 Cloned repository snapshot successfully.",
-      "⚙️ Resolving dependency tree and building AST mapping...",
-      "🔌 Starting database adapters (PostgreSQL, Redis, MongoDB)...",
-      "⚡ Bootstrapping service cluster...",
-      "🟢 Runtime Lab is active and ready on isolated virtual ports."
-    ]);
+    setSandboxLogs(["REQUESTED: Downloading and verifying the latest repository snapshot..."]);
     try {
-      const res = await fetch("http://localhost:4000/api/sandboxes", {
+      const res = await fetch(`${API_BASE_URL}/api/sandboxes`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -162,12 +150,18 @@ export default function Dashboard() {
         const data = await res.json();
         setActiveSandboxId(data.id);
         setSandboxDetails(data);
+        setSandboxLogs([
+          `PROVISIONED: Snapshot ${data.manifest?.snapshotId} at commit ${data.manifest?.commitSha}.`,
+          `VERIFIED: ${data.manifest?.verifiedFileCount || 0} indexed file hashes matched the hydrated repository.`,
+          ...(data.manifest?.execution?.issues || []).map((issue: string) => `CAPABILITY: ${issue}`)
+        ]);
       } else {
-        alert("Failed to initialize sandbox: " + await res.text());
+        const body = await res.json().catch(() => ({ error: "SANDBOX_PROVISIONING_FAILED", message: res.statusText }));
+        setSandboxLogs([`${body.error}: ${body.message}`]);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("Error starting runtime lab.");
+      setSandboxLogs([`SANDBOX_PROVISIONING_FAILED: ${err.message || String(err)}`]);
     } finally {
       setLoadingSandbox(false);
     }
@@ -175,7 +169,7 @@ export default function Dashboard() {
 
   const pollSandboxDetails = async (id: string) => {
     try {
-      const res = await fetch(`http://localhost:4000/api/sandboxes/${id}`, {
+      const res = await fetch(`${API_BASE_URL}/api/sandboxes/${id}`, {
         headers: { "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}` }
       });
       if (res.ok) {
@@ -192,7 +186,7 @@ export default function Dashboard() {
     setRunningSandboxTest(true);
     setSandboxLogs(prev => [...prev, `🧪 Triggering execution of ${type.toUpperCase()} test suite...`]);
     try {
-      const res = await fetch(`http://localhost:4000/api/sandboxes/${activeSandboxId}/test`, {
+      const res = await fetch(`${API_BASE_URL}/api/sandboxes/${activeSandboxId}/test`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -209,7 +203,8 @@ export default function Dashboard() {
         ]);
         await pollSandboxDetails(activeSandboxId);
       } else {
-        setSandboxLogs(prev => [...prev, `❌ Error running sandbox tests: ${res.statusText}`]);
+        const body = await res.json().catch(() => ({ error: "TEST_EXECUTION_FAILED", message: res.statusText }));
+        setSandboxLogs(prev => [...prev, `${body.error}: ${body.message}`]);
       }
     } catch (err: any) {
       console.error(err);
@@ -222,9 +217,9 @@ export default function Dashboard() {
   const handleInjectFailure = async (type: string, serviceName: string) => {
     if (!activeSandboxId) return;
     setInjectingFailure(true);
-    setSandboxLogs(prev => [...prev, `⚠️ Injecting simulated ${type.toUpperCase()} failure on service [${serviceName}]...`]);
+    setSandboxLogs(prev => [...prev, `REQUESTED: Inject ${type.toUpperCase()} failure on service [${serviceName}]...`]);
     try {
-      const res = await fetch(`http://localhost:4000/api/sandboxes/${activeSandboxId}/inject-failure`, {
+      const res = await fetch(`${API_BASE_URL}/api/sandboxes/${activeSandboxId}/inject-failure`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -233,15 +228,15 @@ export default function Dashboard() {
         body: JSON.stringify({ type, serviceName })
       });
       if (res.ok) {
-        setSandboxLogs(prev => [
-          ...prev,
-          type === "crash" 
-            ? `🔥 [${serviceName}] Process exited with error. Status updated to CRASHED.`
-            : `⏱️ [${serviceName}] Response latency increased. High response duration alerts raised.`
+        const data = await res.json();
+        setSandboxLogs(prev => [...prev, data.simulated
+          ? `DEMO DATA: Simulated ${type} injection recorded for ${serviceName}.`
+          : `Failure injection completed for ${serviceName}.`
         ]);
         await pollSandboxDetails(activeSandboxId);
       } else {
-        setSandboxLogs(prev => [...prev, `❌ Error injecting failure: ${res.statusText}`]);
+        const body = await res.json().catch(() => ({ error: "FAILURE_INJECTION_FAILED", message: res.statusText }));
+        setSandboxLogs(prev => [...prev, `${body.error}: ${body.message}`]);
       }
     } catch (err: any) {
       console.error(err);
@@ -254,9 +249,9 @@ export default function Dashboard() {
   const handleRunLoadTest = async () => {
     if (!activeSandboxId) return;
     setRunningLoadTest(true);
-    setSandboxLogs(prev => [...prev, `📈 Simulating concurrent request traffic load...`]);
+    setSandboxLogs(prev => [...prev, "REQUESTED: Run HTTP load test against the active application endpoint..."]);
     try {
-      const res = await fetch(`http://localhost:4000/api/sandboxes/${activeSandboxId}/load-test`, {
+      const res = await fetch(`${API_BASE_URL}/api/sandboxes/${activeSandboxId}/load-test`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -267,14 +262,15 @@ export default function Dashboard() {
         const data = await res.json();
         setSandboxLogs(prev => [
           ...prev,
-          `📈 Load test run results:`,
+          data.simulated ? "DEMO DATA: Simulated load metrics:" : "Load test run results:",
           `  - Throughput: ${data.throughput.toFixed(1)} req/sec`,
           `  - P95 Latency: ${data.latencyP95.toFixed(1)}ms`,
           `  - Error Rate: ${(data.errorRate * 100).toFixed(2)}%`
         ]);
         await pollSandboxDetails(activeSandboxId);
       } else {
-        setSandboxLogs(prev => [...prev, `❌ Error running load tests: ${res.statusText}`]);
+        const body = await res.json().catch(() => ({ error: "LOAD_TEST_FAILED", message: res.statusText }));
+        setSandboxLogs(prev => [...prev, `${body.error}: ${body.message}`]);
       }
     } catch (err: any) {
       console.error(err);
@@ -286,7 +282,7 @@ export default function Dashboard() {
 
   const fetchOrgs = async (authToken: string) => {
     try {
-      const res = await fetch("http://localhost:4000/api/organizations", {
+      const res = await fetch(`${API_BASE_URL}/api/organizations`, {
         headers: { "Authorization": `Bearer ${authToken}` }
       });
       if (res.status === 401) {
@@ -308,7 +304,7 @@ export default function Dashboard() {
 
   const fetchRepoStatus = async (repoId: string, authToken = token) => {
     try {
-      const res = await fetch(`http://localhost:4000/api/repositories/${repoId}/status`, {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/status`, {
         headers: { "Authorization": `Bearer ${authToken || localStorage.getItem("opspilot_token")}` }
       });
       if (res.ok) {
@@ -322,7 +318,7 @@ export default function Dashboard() {
 
   const fetchRepoCapabilities = async (repoId: string, authToken = token) => {
     try {
-      const res = await fetch(`http://localhost:4000/api/repositories/${repoId}/capabilities`, {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/capabilities`, {
         headers: { "Authorization": `Bearer ${authToken || localStorage.getItem("opspilot_token")}` }
       });
       if (res.ok) {
@@ -336,7 +332,7 @@ export default function Dashboard() {
 
   const fetchRepoArchitecture = async (repoId: string, authToken = token) => {
     try {
-      const res = await fetch(`http://localhost:4000/api/repositories/${repoId}/architecture`, {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/architecture`, {
         headers: { "Authorization": `Bearer ${authToken || localStorage.getItem("opspilot_token")}` }
       });
       if (res.ok) {
@@ -350,7 +346,7 @@ export default function Dashboard() {
 
   const fetchRepoFindings = async (repoId: string, authToken = token) => {
     try {
-      const res = await fetch(`http://localhost:4000/api/repositories/${repoId}/findings`, {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/findings`, {
         headers: { "Authorization": `Bearer ${authToken || localStorage.getItem("opspilot_token")}` }
       });
       if (res.ok) {
@@ -364,7 +360,7 @@ export default function Dashboard() {
 
   const fetchRepoLogs = async (repoId: string, authToken = token) => {
     try {
-      const res = await fetch(`http://localhost:4000/api/repositories/${repoId}/logs`, {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/logs`, {
         headers: { "Authorization": `Bearer ${authToken || localStorage.getItem("opspilot_token")}` }
       });
       if (res.ok) {
@@ -380,7 +376,7 @@ export default function Dashboard() {
     if (!orgId) return;
     setLoadingEvaluations(true);
     try {
-      const res = await fetch("http://localhost:4000/api/evaluation", {
+      const res = await fetch(`${API_BASE_URL}/api/evaluation`, {
         headers: { 
           "Authorization": `Bearer ${authToken || localStorage.getItem("opspilot_token")}`,
           "x-organization-id": orgId
@@ -401,7 +397,7 @@ export default function Dashboard() {
     if (!activeOrg?.id) return;
     setRunningEvaluation(true);
     try {
-      const res = await fetch("http://localhost:4000/api/evaluation/run", {
+      const res = await fetch(`${API_BASE_URL}/api/evaluation/run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -426,7 +422,7 @@ export default function Dashboard() {
     setError("");
     try {
       // Fetch Projects
-      const projRes = await fetch("http://localhost:4000/api/projects", {
+      const projRes = await fetch(`${API_BASE_URL}/api/projects`, {
         headers: { 
           "Authorization": `Bearer ${authToken}`,
           "x-organization-id": org.id
@@ -447,14 +443,14 @@ export default function Dashboard() {
       });
 
       // Fetch Members
-      const memberRes = await fetch(`http://localhost:4000/api/organizations/${org.id}/members`, {
+      const memberRes = await fetch(`${API_BASE_URL}/api/organizations/${org.id}/members`, {
         headers: { "Authorization": `Bearer ${authToken}` }
       });
       const memberData = await memberRes.json();
       setMembers(Array.isArray(memberData) ? memberData : []);
 
       // Fetch Audit Logs
-      const auditRes = await fetch("http://localhost:4000/api/audit-logs", {
+      const auditRes = await fetch(`${API_BASE_URL}/api/audit-logs`, {
         headers: { 
           "Authorization": `Bearer ${authToken}`,
           "x-organization-id": org.id
@@ -480,7 +476,7 @@ export default function Dashboard() {
     if (!orgId || !authToken) return;
     setLoadingIncidents(true);
     try {
-      const res = await fetch("http://localhost:4000/api/incidents", {
+      const res = await fetch(`${API_BASE_URL}/api/incidents`, {
         headers: {
           "Authorization": `Bearer ${authToken}`,
           "x-organization-id": orgId
@@ -501,7 +497,7 @@ export default function Dashboard() {
     if (!orgId || !authToken) return;
     setLoadingTimeline(true);
     try {
-      const res = await fetch(`http://localhost:4000/api/incidents/${incidentId}/timeline`, {
+      const res = await fetch(`${API_BASE_URL}/api/incidents/${incidentId}/timeline`, {
         headers: {
           "Authorization": `Bearer ${authToken}`,
           "x-organization-id": orgId
@@ -528,7 +524,7 @@ export default function Dashboard() {
     if (!newComment.trim() || !selectedIncident || !activeOrg) return;
     setSubmittingComment(true);
     try {
-      const res = await fetch(`http://localhost:4000/api/incidents/${selectedIncident.id}/comments`, {
+      const res = await fetch(`${API_BASE_URL}/api/incidents/${selectedIncident.id}/comments`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -552,7 +548,7 @@ export default function Dashboard() {
     if (!selectedIncident || !activeOrg) return;
     setTriggeringInvestigation(true);
     try {
-      const res = await fetch(`http://localhost:4000/api/incidents/${selectedIncident.id}/investigate`, {
+      const res = await fetch(`${API_BASE_URL}/api/incidents/${selectedIncident.id}/investigate`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${token}`,
@@ -579,7 +575,7 @@ export default function Dashboard() {
     e.preventDefault();
     if (!newOrgName) return;
     try {
-      const res = await fetch("http://localhost:4000/api/organizations", {
+      const res = await fetch(`${API_BASE_URL}/api/organizations`, {
         method: "POST",
         headers: { 
           "Content-Type": "application/json",
@@ -603,7 +599,7 @@ export default function Dashboard() {
     e.preventDefault();
     if (!newProjName || !activeOrg) return;
     try {
-      const res = await fetch("http://localhost:4000/api/projects", {
+      const res = await fetch(`${API_BASE_URL}/api/projects`, {
         method: "POST",
         headers: { 
           "Content-Type": "application/json",
@@ -629,7 +625,7 @@ export default function Dashboard() {
     e.preventDefault();
     if (!inviteEmail || !activeOrg) return;
     try {
-      const res = await fetch(`http://localhost:4000/api/organizations/${activeOrg.id}/invitations`, {
+      const res = await fetch(`${API_BASE_URL}/api/organizations/${activeOrg.id}/invitations`, {
         method: "POST",
         headers: { 
           "Content-Type": "application/json",
@@ -654,7 +650,7 @@ export default function Dashboard() {
     e.preventDefault();
     if (!repoName || !gitUrl || !selectedProjectId) return;
     try {
-      const res = await fetch(`http://localhost:4000/api/repositories/projects/${selectedProjectId}/repositories`, {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/projects/${selectedProjectId}/repositories`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -689,7 +685,7 @@ export default function Dashboard() {
   const handleRunIndex = async (repoId: string) => {
     setRepoStatuses(prev => ({ ...prev, [repoId]: { ...prev[repoId], status: "INDEXING" } }));
     try {
-      const res = await fetch(`http://localhost:4000/api/repositories/${repoId}/index`, {
+      const res = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/index`, {
         method: "POST",
         headers: { "Authorization": `Bearer ${token}` }
       });
@@ -753,7 +749,7 @@ export default function Dashboard() {
       setLoadingFileContent(true);
       setFileContent(null);
       try {
-        const res = await fetch(`http://localhost:4000/api/repositories/${selectedRepoId}/file?path=${filePath}`, {
+        const res = await fetch(`${API_BASE_URL}/api/repositories/${selectedRepoId}/file?path=${filePath}`, {
           headers: { "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}` }
         });
         if (res.ok) {
@@ -807,7 +803,7 @@ export default function Dashboard() {
           activeOrganizationId = organizations[0].id;
         } else {
           setScanProgress(prev => [...prev, "🛠️ Creating default organization workspace..."]);
-          const orgRes = await fetch("http://localhost:4000/api/organizations", {
+          const orgRes = await fetch(`${API_BASE_URL}/api/organizations`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
@@ -825,7 +821,7 @@ export default function Dashboard() {
 
       // 2. Fetch Projects and look for a matching Repository or find/create Project
       setScanProgress(prev => [...prev, "📂 Resolving Project and checking existing repository mapping..."]);
-      const projRes = await fetch("http://localhost:4000/api/projects", {
+      const projRes = await fetch(`${API_BASE_URL}/api/projects`, {
         headers: {
           "Authorization": `Bearer ${currentToken}`,
           "x-organization-id": activeOrganizationId || ""
@@ -837,7 +833,7 @@ export default function Dashboard() {
       
       let targetProj = projList[0];
       if (!targetProj) {
-        const createProjRes = await fetch("http://localhost:4000/api/projects", {
+        const createProjRes = await fetch(`${API_BASE_URL}/api/projects`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -864,7 +860,7 @@ export default function Dashboard() {
         setScanProgress(prev => [...prev, `✓ Found existing repository mapping (ID: ${repoId}). Reusing it.`]);
       } else {
         setScanProgress(prev => [...prev, "📡 Connecting repository and registering snapshot triggers..."]);
-        const connectRes = await fetch(`http://localhost:4000/api/repositories/projects/${targetProj.id}/repositories`, {
+        const connectRes = await fetch(`${API_BASE_URL}/api/repositories/projects/${targetProj.id}/repositories`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -891,7 +887,7 @@ export default function Dashboard() {
 
       // 3. Trigger manual index run
       setScanProgress(prev => [...prev, "⚡ Triggering repository index run webhook..."]);
-      const indexRes = await fetch(`http://localhost:4000/api/repositories/${repoId}/index`, {
+      const indexRes = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/index`, {
         method: "POST",
         headers: { "Authorization": `Bearer ${currentToken}` }
       });
@@ -907,13 +903,13 @@ export default function Dashboard() {
         await new Promise(resolve => setTimeout(resolve, 2000));
         attempts++;
 
-        const statusRes = await fetch(`http://localhost:4000/api/repositories/${repoId}/status`, {
+        const statusRes = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/status`, {
           headers: { "Authorization": `Bearer ${currentToken}` }
         });
         if (statusRes.ok) {
           const statusData = await statusRes.json();
           
-          const logsRes = await fetch(`http://localhost:4000/api/repositories/${repoId}/logs`, {
+          const logsRes = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/logs`, {
             headers: { "Authorization": `Bearer ${currentToken}` }
           });
           if (logsRes.ok) {
@@ -945,7 +941,7 @@ export default function Dashboard() {
       setScanProgress(prev => [...prev, "🔬 Ingestion finished. Initiating Static Code Auditing rules..."]);
 
       // 5. Retrieve Static Findings
-      const findingsRes = await fetch(`http://localhost:4000/api/repositories/${repoId}/findings`, {
+      const findingsRes = await fetch(`${API_BASE_URL}/api/repositories/${repoId}/findings`, {
         headers: { "Authorization": `Bearer ${currentToken}` }
       });
       if (!findingsRes.ok) throw new Error("Failed to fetch static findings: " + await findingsRes.text());
@@ -958,7 +954,7 @@ export default function Dashboard() {
       setScanProgress(prev => [...prev, "🚀 Provisioning dynamic testing sandbox context..."]);
 
       // 6. Initialize Sandbox Environment
-      const sandboxRes = await fetch("http://localhost:4000/api/sandboxes", {
+      const sandboxRes = await fetch(`${API_BASE_URL}/api/sandboxes`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -970,7 +966,24 @@ export default function Dashboard() {
       if (!sandboxRes.ok) throw new Error("Failed to initialize sandbox environment: " + await sandboxRes.text());
       const sandboxData = await sandboxRes.json();
       const sandboxId = sandboxData.id;
-      setScanProgress(prev => [...prev, `✓ Ephemeral sandbox ready (ID: ${sandboxId}). Starting stack services...`]);
+      setScanProgress(prev => [
+        ...prev,
+        `✓ Hydrated snapshot ${sandboxData.manifest?.snapshotId} at exact commit ${sandboxData.manifest?.commitSha}.`,
+        `✓ Verified ${sandboxData.manifest?.verifiedFileCount || 0} indexed file hashes.`
+      ]);
+
+      const buildRes = await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}/build`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${currentToken}`
+        }
+      });
+      if (!buildRes.ok) {
+        const buildFailure = await buildRes.json().catch(() => ({ error: "DEPENDENCY_INSTALL_FAILED", message: buildRes.statusText }));
+        throw new Error(`${buildFailure.error}: ${buildFailure.message || buildFailure.log || "Dependency installation failed"}`);
+      }
+      setScanProgress(prev => [...prev, "✓ Deterministic dependency installation completed in the sandbox container."]);
 
       setScanStepStatuses(prev => ({ ...prev, sandbox: "success", dynamic: "running" }));
       setScanStatus("dynamic_tests");
@@ -978,7 +991,7 @@ export default function Dashboard() {
 
       // 7. Run Unit/E2E Tests to identify runtime failures
       setScanProgress(prev => [...prev, "🧪 Executing unit tests in sandbox container..."]);
-      const unitTestRes = await fetch(`http://localhost:4000/api/sandboxes/${sandboxId}/test`, {
+      const unitTestRes = await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}/test`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1004,7 +1017,7 @@ export default function Dashboard() {
       }
 
       setScanProgress(prev => [...prev, "🧪 Executing integration/E2E verification tests in sandbox..."]);
-      const e2eTestRes = await fetch(`http://localhost:4000/api/sandboxes/${sandboxId}/test`, {
+      const e2eTestRes = await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}/test`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1042,14 +1055,19 @@ export default function Dashboard() {
 
       // Clean up sandbox
       setScanProgress(prev => [...prev, "🧹 Cleaning up sandbox resources..."]);
-      await fetch(`http://localhost:4000/api/sandboxes/${sandboxId}`, {
+      await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}`, {
         method: "DELETE",
         headers: { "Authorization": `Bearer ${currentToken}` }
       });
 
-      setScanStepStatuses(prev => ({ ...prev, dynamic: "success" }));
+      setScanStepStatuses(prev => ({ ...prev, dynamic: unitSuccess && e2eSuccess ? "success" : "failed" }));
       setScanStatus("completed");
-      setScanProgress(prev => [...prev, "🎉 Automated Static and Dynamic Scan complete! Summary report loaded below."]);
+      setScanProgress(prev => [
+        ...prev,
+        unitSuccess && e2eSuccess
+          ? "Automated static and dynamic scan completed with all configured tests passing."
+          : "Automated scan completed with dynamic test failures or missing test capabilities."
+      ]);
 
       if (activeOrganizationId) {
         handleSelectOrg({ id: activeOrganizationId, name: activeOrg?.name || "Workspace", createdAt: "" }, currentToken);
@@ -2455,6 +2473,7 @@ export default function Dashboard() {
     const testRuns = sandboxDetails.testRuns || [];
     const loadRuns = sandboxDetails.loadRuns || [];
     const failures = sandboxDetails.failures || [];
+    const sandboxFailed = String(sandboxDetails.status || "").includes("FAILED");
 
     // Latest load stats
     const latestLoad = loadRuns[0] || { throughput: 0, latencyP95: 0, errorRate: 0 };
@@ -2467,9 +2486,14 @@ export default function Dashboard() {
           <div>
             <h3 style={{ fontSize: "28px", fontFamily: "Space Grotesk", display: "flex", alignItems: "center", gap: "10px" }}>
               <Cpu size={24} color="var(--accent-cyan)" /> Secure Runtime Lab
+              {sandboxDetails.demoData && (
+                <span style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "5px", background: "#ffd700", color: "#111", fontWeight: "800" }}>
+                  DEMO DATA
+                </span>
+              )}
             </h3>
             <p style={{ color: "var(--text-secondary)", fontSize: "14px", marginTop: "4px" }}>
-              Active Sandbox Environment ID: <code style={{ color: "var(--accent-cyan)" }}>{sandboxDetails.id}</code> • Status: <span style={{ fontWeight: "700", color: "#00ff7f" }}>{sandboxDetails.status}</span>
+              Active Sandbox Environment ID: <code style={{ color: "var(--accent-cyan)" }}>{sandboxDetails.id}</code> • Status: <span style={{ fontWeight: "700", color: sandboxFailed ? "var(--accent-magenta)" : "#00ff7f" }}>{sandboxDetails.status}</span>
             </p>
           </div>
           <button 
@@ -2522,6 +2546,11 @@ export default function Dashboard() {
               </h4>
               
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+                {services.length === 0 && (
+                  <p style={{ color: "var(--text-muted)", fontSize: "13px" }}>
+                    No application or dependency container has been started.
+                  </p>
+                )}
                 {services.map((svc: any) => {
                   const isCrashed = svc.status === "CRASHED";
                   const statusColor = isCrashed ? "var(--accent-magenta)" : svc.status === "RUNNING" ? "#00ff7f" : "#ffa500";
@@ -2625,12 +2654,14 @@ export default function Dashboard() {
             <div className="glass-card">
               <h4 style={{ fontSize: "18px", marginBottom: "16px" }}>Failure Injection System</h4>
               <p style={{ fontSize: "13px", color: "var(--text-secondary)", marginBottom: "16px" }}>
-                Inject artificial latencies or force service crashes to evaluate the recovery policies.
+                {sandboxDetails.demoData
+                  ? "Demo-only simulated injections are visibly labeled and do not affect a real process."
+                  : "Real failure injection is not available yet for this isolated runner."}
               </p>
               <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
                 <button 
                   onClick={() => handleInjectFailure("latency", "api-service")}
-                  disabled={injectingFailure}
+                  disabled={injectingFailure || !sandboxDetails.demoData}
                   className="btn-secondary"
                   style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", border: "1px solid rgba(255,165,0,0.3)" }}
                 >
@@ -2639,7 +2670,7 @@ export default function Dashboard() {
                 </button>
                 <button 
                   onClick={() => handleInjectFailure("crash", "api-service")}
-                  disabled={injectingFailure}
+                  disabled={injectingFailure || !sandboxDetails.demoData}
                   className="btn-secondary"
                   style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", border: "1px solid rgba(244,63,94,0.3)" }}
                 >
@@ -2651,18 +2682,20 @@ export default function Dashboard() {
 
             {/* Traffic Load Panel */}
             <div className="glass-card">
-              <h4 style={{ fontSize: "18px", marginBottom: "16px" }}>Virtual Traffic Load Simulator</h4>
+              <h4 style={{ fontSize: "18px", marginBottom: "16px" }}>Traffic Load Test</h4>
               <p style={{ fontSize: "13px", color: "var(--text-secondary)", marginBottom: "16px" }}>
-                Simulate heavy user request loads to stress-test microservice communication lanes.
+                {sandboxDetails.demoData
+                  ? "Demo metrics are simulated and visibly labeled."
+                  : "A real HTTP load driver has not been configured for this sandbox."}
               </p>
               <button 
                 onClick={handleRunLoadTest}
-                disabled={runningLoadTest}
+                disabled={runningLoadTest || !sandboxDetails.demoData}
                 className="btn-primary"
                 style={{ width: "100%", padding: "12px", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}
               >
                 <Play size={14} fill="#050811" />
-                {runningLoadTest ? "Simulating load traffic..." : "Simulate Heavy Load Traffic"}
+                {runningLoadTest ? "Running load test..." : "Run Load Test"}
               </button>
             </div>
 
@@ -2821,7 +2854,7 @@ export default function Dashboard() {
                     </div>
                     <button 
                       onClick={async () => {
-                        await fetch("http://localhost:4000/api/admin/controls/disable-tool", {
+                        await fetch(`${API_BASE_URL}/api/admin/controls/disable-tool`, {
                           method: "POST",
                           headers: {
                             "Content-Type": "application/json",
@@ -2848,7 +2881,7 @@ export default function Dashboard() {
                     </div>
                     <button 
                       onClick={async () => {
-                        await fetch("http://localhost:4000/api/admin/feature-flags", {
+                        await fetch(`${API_BASE_URL}/api/admin/feature-flags`, {
                           method: "POST",
                           headers: {
                             "Content-Type": "application/json",

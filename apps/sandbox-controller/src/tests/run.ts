@@ -1,101 +1,135 @@
 import assert from "node:assert";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { SandboxManager } from "../sandbox.js";
+import { PassThrough } from "node:stream";
+import archiver from "archiver";
+import { SandboxManager, SandboxProvisionError } from "../sandbox.js";
+import { discoverExecutionManifest } from "../executionManifest.js";
+import { ContainerRunner, ContainerRunOptions, ContainerRunResult } from "../containerRunner.js";
 import { DependencyResolver } from "../dependencyResolver.js";
 import { ServiceStartupManager } from "../serviceStartup.js";
-import { TelemetryCollector } from "../telemetry.js";
 import { TestRunner } from "../testRunner.js";
 import { CleanupManager } from "../cleanup.js";
-import { server } from "../index.js";
 
-async function runTests() {
-  console.log("=== Running Sandbox Controller Unit Tests ===");
-
-  const sm = new SandboxManager();
-  const dr = new DependencyResolver(true); 
-  const ss = new ServiceStartupManager(true);
-  const tc = new TelemetryCollector();
-  const tr = new TestRunner(true);
-  const cl = new CleanupManager();
-
-  let sandboxId: string | null = null;
-  let workspaceDir: string | null = null;
-
-  console.log("\n1. Testing Sandbox Workspace Allocation...");
-  {
-    sandboxId = await sm.createSandbox("test-snapshot-sha");
-    assert(sandboxId.startsWith("sb-"));
-    
-    workspaceDir = sm.getWorkspaceDir(sandboxId);
-    assert(fs.existsSync(workspaceDir));
-    assert(fs.existsSync(path.join(workspaceDir, "package.json")));
-    assert(fs.existsSync(path.join(workspaceDir, "index.js")));
-    console.log("✓ Sandbox allocated successfully.");
+class FakeContainerRunner extends ContainerRunner {
+  public override async run(_options: ContainerRunOptions): Promise<ContainerRunResult> {
+    return { success: true, exitCode: 0, log: "real command result fixture", timedOut: false };
   }
 
-  console.log("\n2. Testing Dependency Resolver...");
-  {
-    const res = await dr.resolve(workspaceDir!, sandboxId);
-    assert.strictEqual(res.success, true);
-    console.log("✓ Dependency resolver completed.");
+  public override async startDetached(
+    _options: ContainerRunOptions & { ports?: number[] }
+  ): Promise<ContainerRunResult & { containerId?: string }> {
+    return {
+      success: true,
+      exitCode: 0,
+      log: "container-fixture",
+      timedOut: false,
+      containerId: "container-fixture"
+    };
   }
 
-  console.log("\n3. Testing Service Startup Manager...");
-  {
-    const res = await ss.startService(
-      sandboxId,
-      workspaceDir!,
-      "test-service",
-      "node index.js"
-    );
-    assert.strictEqual(res.success, true);
-    assert(res.pid !== undefined);
-
-    const procs = ss.getActiveProcesses(sandboxId);
-    assert.strictEqual(procs.length, 1);
-    console.log("✓ Service started successfully.");
-  }
-
-  console.log("\n4. Testing Telemetry Collector...");
-  {
-    const procs = ss.getActiveProcesses(sandboxId);
-    const metrics = tc.captureSystemMetrics(procs);
-    assert.strictEqual(metrics.cpuUsage, 15); 
-    assert.strictEqual(metrics.memoryUsageBytes, 50 * 1024 * 1024);
-    console.log("✓ Telemetry collection completed.");
-  }
-
-  console.log("\n5. Testing Test Runner...");
-  {
-    const res = await tr.runTests(
-      sandboxId,
-      workspaceDir!,
-      "unit",
-      "node test.js"
-    );
-    assert.strictEqual(res.success, true);
-    assert(res.log.includes("Tests run: 5"));
-    console.log("✓ Test execution completed.");
-  }
-
-  console.log("\n6. Testing Cleanup Manager...");
-  {
-    const procs = ss.getActiveProcesses(sandboxId);
-    await cl.terminateProcesses(procs);
-    ss.clearProcesses(sandboxId);
-
-    await cl.deleteWorkspaceDir(workspaceDir!);
-    assert(!fs.existsSync(workspaceDir!));
-    console.log("✓ Cleanup and workspace erasure completed.");
-  }
-
-  server.close();
-  console.log("\nALL SANDBOX CONTROLLER TESTS PASSED SUCCESSFULLY!");
+  public override async stop(_containerId: string): Promise<void> {}
 }
 
-runTests().catch((err) => {
-  console.error("\nTEST RUN FAILED:", err);
-  server.close();
+async function runTests() {
+  const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "opspilot-sandbox-test-"));
+  const repositoryRoot = path.join(tempRoot, "repository");
+  await fs.promises.mkdir(repositoryRoot, { recursive: true });
+  await fs.promises.writeFile(
+    path.join(repositoryRoot, "package.json"),
+    JSON.stringify({
+      scripts: { start: "node index.js", test: "node --test", build: "tsc" },
+      dependencies: { express: "1.0.0", pg: "1.0.0" }
+    })
+  );
+  await fs.promises.writeFile(path.join(repositoryRoot, "package-lock.json"), "{}");
+  const manifest = await discoverExecutionManifest(repositoryRoot);
+
+  assert.deepStrictEqual(manifest.installCommand, ["npm", "ci"]);
+  assert.strictEqual(manifest.testCommands[0].type, "unit");
+  assert.strictEqual(manifest.services[0].type, "postgresql");
+
+  const failingManager = new SandboxManager({
+    baseDir: tempRoot,
+    persistSandbox: false,
+    loadSnapshot: async () => ({ id: "snap-1", commitSha: "abc123", archiveUrl: "file:///missing.zip" }),
+    downloadSnapshot: async () => { throw new Error("not found"); },
+    loadIndexedFiles: async () => []
+  });
+  await assert.rejects(
+    () => failingManager.createSandbox("snap-1"),
+    (error: unknown) => error instanceof SandboxProvisionError && error.code === "SNAPSHOT_DOWNLOAD_FAILED"
+  );
+
+  const packageContent = JSON.stringify({
+    scripts: { start: "node index.js", test: "node --test" },
+    dependencies: { express: "1.0.0" }
+  });
+  const snapshotArchive = await createZip({
+    "opspilot-snapshot.json": JSON.stringify({ repositoryId: "repo-1", commitSha: "abc123" }),
+    "package.json": packageContent,
+    "package-lock.json": "{}"
+  });
+  const packageHash = crypto.createHash("sha256").update(packageContent).digest("hex");
+  const hydratedManager = new SandboxManager({
+    baseDir: path.join(tempRoot, "hydrated"),
+    persistSandbox: false,
+    loadSnapshot: async () => ({ id: "snap-2", commitSha: "abc123", archiveUrl: "memory://snap-2" }),
+    downloadSnapshot: async () => snapshotArchive,
+    loadIndexedFiles: async () => [{ path: "package.json", hash: packageHash }]
+  });
+  const hydratedSandboxId = await hydratedManager.createSandbox("snap-2");
+  const hydratedManifest = hydratedManager.getWorkspaceManifest(hydratedSandboxId);
+  assert.strictEqual(hydratedManifest.commitSha, "abc123");
+  assert.strictEqual(hydratedManifest.verifiedFileCount, 1);
+  assert.strictEqual(
+    crypto.createHash("sha256")
+      .update(await fs.promises.readFile(path.join(hydratedManifest.repositoryRoot, "package.json")))
+      .digest("hex"),
+    packageHash
+  );
+
+  const runner = new FakeContainerRunner();
+  const dependencyResult = await new DependencyResolver(true, runner).resolve(repositoryRoot, "sb-test", manifest);
+  assert.strictEqual(dependencyResult.success, true);
+
+  const testResult = await new TestRunner(true, runner).runTests("sb-test", repositoryRoot, "unit", manifest);
+  assert.strictEqual(testResult.success, true);
+
+  const serviceManager = new ServiceStartupManager(true, runner);
+  const serviceResult = await serviceManager.startService(
+    "sb-test",
+    repositoryRoot,
+    { id: "app", name: "app", command: ["npm", "start"] }
+  );
+  assert.strictEqual(serviceResult.success, true);
+  assert.deepStrictEqual(serviceManager.getActiveContainers("sb-test"), ["container-fixture"]);
+  await serviceManager.stopAll("sb-test");
+
+  await new CleanupManager().deleteWorkspaceDir(tempRoot);
+  assert.strictEqual(fs.existsSync(tempRoot), false);
+  console.log("ALL SANDBOX CONTROLLER TESTS PASSED");
+}
+
+async function createZip(files: Record<string, string>): Promise<Buffer> {
+  const archive = archiver("zip", { zlib: { level: 9 } });
+  const output = new PassThrough();
+  const chunks: Buffer[] = [];
+  output.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+  const completed = new Promise<void>((resolve, reject) => {
+    output.on("end", resolve);
+    output.on("error", reject);
+  });
+  archive.pipe(output);
+  for (const [name, content] of Object.entries(files)) archive.append(content, { name });
+  await archive.finalize();
+  await completed;
+  return Buffer.concat(chunks);
+}
+
+runTests().catch((error) => {
+  console.error("TEST RUN FAILED:", error);
   process.exit(1);
 });

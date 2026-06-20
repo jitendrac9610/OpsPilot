@@ -1,43 +1,46 @@
-import fs from "node:fs";
-import path from "node:path";
-import { exec } from "node:child_process";
 import { prisma } from "@opspilot/database";
 import { logger } from "@opspilot/shared";
+import { ContainerRunner } from "./containerRunner.js";
+import { ExecutionManifest } from "./executionManifest.js";
 
 export class DependencyResolver {
-  private dbFallback = false;
+  constructor(
+    private readonly dbFallback = false,
+    private readonly runner = new ContainerRunner()
+  ) {}
 
-  constructor(dbFallback = false) {
-    this.dbFallback = dbFallback;
-  }
+  public async resolve(
+    workspaceDir: string,
+    sandboxId: string,
+    manifest: ExecutionManifest
+  ): Promise<{ success: boolean; log: string; exitCode: number | null }> {
+    logger.info({ workspaceDir, sandboxId }, "Installing locked dependencies in isolated container");
 
-  public async resolve(workspaceDir: string, sandboxId: string): Promise<{ success: boolean; log: string }> {
-    logger.info({ workspaceDir, sandboxId }, "Resolving and installing locked dependencies");
-
-    let cmd = "npm install";
-    if (fs.existsSync(path.join(workspaceDir, "pnpm-lock.yaml"))) {
-      cmd = "pnpm install";
-    } else if (fs.existsSync(path.join(workspaceDir, "yarn.lock"))) {
-      cmd = "yarn install";
+    if (manifest.installCommand.length === 0) {
+      return this.persist(sandboxId, {
+        success: false,
+        exitCode: null,
+        log: "LOCKFILE_REQUIRED: A deterministic install command could not be discovered."
+      });
     }
 
-    logger.info({ cmd, workspaceDir }, "Running dependency installer command");
-
-    // For test simulation, if node_modules doesn't exist, we can create a mock package-lock or just run command
-    // Since we write mock scripts, we can run command which will complete instantly (since there are no dependencies).
-    const result = await new Promise<{ success: boolean; log: string }>((resolve) => {
-      exec(cmd, { cwd: workspaceDir }, (error, stdout, stderr) => {
-        const log = stdout + "\n" + stderr;
-        if (error) {
-          logger.error({ error, cmd }, "Dependency installation failed");
-          resolve({ success: false, log });
-        } else {
-          logger.info({ cmd }, "Dependency installation completed successfully");
-          resolve({ success: true, log });
-        }
-      });
+    const result = await this.runner.run({
+      sandboxId,
+      workspaceDir,
+      command: manifest.installCommand,
+      allowNetwork: true
     });
+    return this.persist(sandboxId, {
+      success: result.success,
+      exitCode: result.exitCode,
+      log: result.log
+    });
+  }
 
+  private async persist(
+    sandboxId: string,
+    result: { success: boolean; log: string; exitCode: number | null }
+  ) {
     if (!this.dbFallback) {
       try {
         await prisma.buildRun.create({
@@ -47,11 +50,10 @@ export class DependencyResolver {
             log: result.log
           }
         });
-      } catch (err: any) {
-        logger.warn({ err }, "Failed to write BuildRun log to database");
+      } catch (error) {
+        logger.warn({ error }, "Failed to persist dependency installation result");
       }
     }
-
     return result;
   }
 }

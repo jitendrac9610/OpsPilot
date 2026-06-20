@@ -1,14 +1,14 @@
 import express, { Express } from "express";
 import { Server } from "node:http";
 import { logger } from "@opspilot/shared";
-import { SandboxManager } from "./sandbox.js";
+import { SandboxManager, SandboxProvisionError } from "./sandbox.js";
 import { DependencyResolver } from "./dependencyResolver.js";
 import { ServiceStartupManager } from "./serviceStartup.js";
 import { TestRunner } from "./testRunner.js";
 import { CleanupManager } from "./cleanup.js";
 
 const app: Express = express();
-app.use(express.json());
+app.use(express.json({ limit: "256kb" }));
 
 const sandboxManager = new SandboxManager();
 const dependencyResolver = new DependencyResolver();
@@ -16,133 +16,112 @@ const serviceStartupManager = new ServiceStartupManager();
 const testRunner = new TestRunner();
 const cleanupManager = new CleanupManager();
 
-const sandboxWorkspaces = new Map<string, string>();
-
 app.post("/api/sandboxes", async (req, res) => {
   try {
     const { snapshotId } = req.body;
-    if (!snapshotId) {
-      return res.status(400).json({ error: "Missing snapshotId parameter" });
+    if (!snapshotId || typeof snapshotId !== "string") {
+      return res.status(400).json({ error: "VALIDATION_ERROR", message: "snapshotId is required" });
     }
 
     const sandboxId = await sandboxManager.createSandbox(snapshotId);
-    const workspaceDir = sandboxManager.getWorkspaceDir(sandboxId);
-    sandboxWorkspaces.set(sandboxId, workspaceDir);
-
-    return res.status(201).json({ id: sandboxId, workspaceDir });
-  } catch (err: any) {
-    logger.error({ err }, "Failed to create sandbox");
-    return res.status(500).json({ error: err.message || "Internal server error" });
+    const manifest = sandboxManager.getWorkspaceManifest(sandboxId);
+    return res.status(201).json({
+      id: sandboxId,
+      status: "PROVISIONED",
+      manifest
+    });
+  } catch (error) {
+    logger.error({ error }, "Failed to create sandbox");
+    if (error instanceof SandboxProvisionError) {
+      return res.status(error.code === "SNAPSHOT_NOT_FOUND" ? 404 : 422).json({
+        error: error.code,
+        message: error.message
+      });
+    }
+    return res.status(500).json({ error: "SANDBOX_PROVISIONING_FAILED", message: "Sandbox provisioning failed." });
   }
 });
 
 app.post("/api/sandboxes/:id/build", async (req, res) => {
   try {
     const sandboxId = req.params.id;
-    const workspaceDir = sandboxWorkspaces.get(sandboxId) || sandboxManager.getWorkspaceDir(sandboxId);
-
-    await sandboxManager.updateStatus(sandboxId, "BUILDING");
-    const result = await dependencyResolver.resolve(workspaceDir, sandboxId);
-    
-    if (result.success) {
-      await sandboxManager.updateStatus(sandboxId, "BUILT");
-    } else {
-      await sandboxManager.updateStatus(sandboxId, "BUILD_FAILED");
-    }
-
-    return res.json(result);
-  } catch (err: any) {
-    logger.error({ err }, "Build execution failed");
-    return res.status(500).json({ error: err.message || "Internal server error" });
+    const manifest = sandboxManager.getWorkspaceManifest(sandboxId);
+    await sandboxManager.updateStatus(sandboxId, "INSTALLING_DEPENDENCIES");
+    const result = await dependencyResolver.resolve(manifest.repositoryRoot, sandboxId, manifest.execution);
+    await sandboxManager.updateStatus(sandboxId, result.success ? "DEPENDENCIES_INSTALLED" : "DEPENDENCY_INSTALL_FAILED");
+    return res.status(result.success ? 200 : 422).json(result);
+  } catch (error) {
+    logger.error({ error }, "Dependency installation failed");
+    return res.status(500).json({ error: "DEPENDENCY_INSTALL_FAILED", message: "Dependency installation failed." });
   }
 });
 
 app.post("/api/sandboxes/:id/start", async (req, res) => {
   try {
     const sandboxId = req.params.id;
-    const { name, command, args, port } = req.body;
-
-    if (!name || !command) {
-      return res.status(400).json({ error: "Missing name or command parameter" });
+    const { serviceId, environment = {} } = req.body;
+    if (!serviceId || typeof serviceId !== "string") {
+      return res.status(400).json({ error: "VALIDATION_ERROR", message: "serviceId is required" });
     }
 
-    const workspaceDir = sandboxWorkspaces.get(sandboxId) || sandboxManager.getWorkspaceDir(sandboxId);
-    await sandboxManager.updateStatus(sandboxId, "STARTING_SERVICES");
+    const manifest = sandboxManager.getWorkspaceManifest(sandboxId);
+    const service = manifest.execution.startCommands.find((candidate) => candidate.id === serviceId);
+    if (!service) {
+      return res.status(404).json({ error: "SERVICE_COMMAND_NOT_DISCOVERED", message: `Unknown serviceId ${serviceId}` });
+    }
 
-    const result = await serviceStartupManager.startService(
-      sandboxId,
-      workspaceDir,
-      name,
-      command,
-      args || [],
-      port
+    const allowedEnvironment = new Set(manifest.execution.requiredEnvironment.map((item) => item.name));
+    const filteredEnvironment = Object.fromEntries(
+      Object.entries(environment as Record<string, string>)
+        .filter(([key, value]) => allowedEnvironment.has(key) && typeof value === "string")
     );
 
-    if (result.success) {
-      await sandboxManager.updateStatus(sandboxId, "SERVICES_RUNNING");
-    } else {
-      await sandboxManager.updateStatus(sandboxId, "SERVICE_STARTUP_FAILED");
-    }
-
-    return res.json(result);
-  } catch (err: any) {
-    logger.error({ err }, "Service startup failed");
-    return res.status(500).json({ error: err.message || "Internal server error" });
+    await sandboxManager.updateStatus(sandboxId, "STARTING_SERVICES");
+    const result = await serviceStartupManager.startService(
+      sandboxId,
+      manifest.repositoryRoot,
+      service,
+      filteredEnvironment
+    );
+    await sandboxManager.updateStatus(sandboxId, result.success ? "SERVICES_RUNNING" : "SERVICE_STARTUP_FAILED");
+    return res.status(result.success ? 200 : 422).json(result);
+  } catch (error) {
+    logger.error({ error }, "Service startup failed");
+    return res.status(500).json({ error: "SERVICE_STARTUP_FAILED", message: "Service startup failed." });
   }
 });
 
 app.post("/api/sandboxes/:id/test", async (req, res) => {
   try {
     const sandboxId = req.params.id;
-    const { type, command } = req.body;
-
-    if (!type) {
-      return res.status(400).json({ error: "Missing test type parameter" });
+    const type = req.body.type as "unit" | "integration" | "e2e";
+    if (!["unit", "integration", "e2e"].includes(type)) {
+      return res.status(400).json({ error: "VALIDATION_ERROR", message: "type must be unit, integration, or e2e" });
     }
 
-    const workspaceDir = sandboxWorkspaces.get(sandboxId) || sandboxManager.getWorkspaceDir(sandboxId);
-    await sandboxManager.updateStatus(sandboxId, "TESTING");
-
-    const result = await testRunner.runTests(
-      sandboxId,
-      workspaceDir,
-      type,
-      command || "npm test"
-    );
-
-    if (result.success) {
-      await sandboxManager.updateStatus(sandboxId, "TESTS_PASSED");
-    } else {
-      await sandboxManager.updateStatus(sandboxId, "TESTS_FAILED");
-    }
-
-    return res.json(result);
-  } catch (err: any) {
-    logger.error({ err }, "Test runner execution failed");
-    return res.status(500).json({ error: err.message || "Internal server error" });
+    const manifest = sandboxManager.getWorkspaceManifest(sandboxId);
+    await sandboxManager.updateStatus(sandboxId, `RUNNING_${type.toUpperCase()}_TESTS`);
+    const result = await testRunner.runTests(sandboxId, manifest.repositoryRoot, type, manifest.execution);
+    await sandboxManager.updateStatus(sandboxId, result.success ? "TESTS_PASSED" : "TESTS_FAILED");
+    return res.status(result.success ? 200 : 422).json(result);
+  } catch (error) {
+    logger.error({ error }, "Test execution failed");
+    return res.status(500).json({ error: "TEST_EXECUTION_FAILED", message: "Test execution failed." });
   }
 });
 
 app.delete("/api/sandboxes/:id", async (req, res) => {
   try {
     const sandboxId = req.params.id;
-    const workspaceDir = sandboxWorkspaces.get(sandboxId) || sandboxManager.getWorkspaceDir(sandboxId);
-
+    const workspaceDir = sandboxManager.getWorkspaceDir(sandboxId);
     await sandboxManager.updateStatus(sandboxId, "TERMINATING");
-
-    const procs = serviceStartupManager.getActiveProcesses(sandboxId);
-    await cleanupManager.terminateProcesses(procs);
-    serviceStartupManager.clearProcesses(sandboxId);
-
+    await serviceStartupManager.stopAll(sandboxId);
     await cleanupManager.deleteWorkspaceDir(workspaceDir);
-    sandboxWorkspaces.delete(sandboxId);
-
     await sandboxManager.updateStatus(sandboxId, "DESTROYED");
-
-    return res.json({ success: true, message: `Sandbox ${sandboxId} destroyed successfully.` });
-  } catch (err: any) {
-    logger.error({ err }, "Cleanup execution failed");
-    return res.status(500).json({ error: err.message || "Internal server error" });
+    return res.json({ success: true, message: `Sandbox ${sandboxId} destroyed.` });
+  } catch (error) {
+    logger.error({ error }, "Sandbox cleanup failed");
+    return res.status(500).json({ error: "SANDBOX_CLEANUP_FAILED", message: "Sandbox cleanup failed." });
   }
 });
 
@@ -153,6 +132,8 @@ const server: Server = app.listen(PORT, () => {
 
 export { app, server };
 export * from "./sandbox.js";
+export * from "./executionManifest.js";
+export * from "./containerRunner.js";
 export * from "./dependencyResolver.js";
 export * from "./serviceStartup.js";
 export * from "./telemetry.js";

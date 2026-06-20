@@ -40,9 +40,12 @@ export class ModelGateway {
     }
 
     if (!this.apiKey) {
-      logger.warn(`ModelGateway: No API key configured for provider ${this.provider}. Running in Mock/Dry-Run mode.`);
-      const decision = this.getMockDecisionForState(state);
-      return { decision, promptTokens: 0, completionTokens: 0 };
+      if (config.isDemoMode) {
+        logger.warn(`ModelGateway: No API key configured for ${this.provider}; using clearly marked demo decisions.`);
+        const decision = this.getMockDecisionForState(state);
+        return { decision, promptTokens: 0, completionTokens: 0 };
+      }
+      throw new Error(`MODEL_PROVIDER_NOT_CONFIGURED: No API key configured for ${this.provider}.`);
     }
 
     if (this.provider === "openrouter") {
@@ -95,7 +98,8 @@ export class ModelGateway {
           completionTokens
         };
       } catch (err: any) {
-        logger.error({ err }, "OpenRouter API call failed, falling back to mock mode");
+        logger.error({ err }, "OpenRouter API call failed");
+        if (!config.isDemoMode) throw err;
         const decision = this.getMockDecisionForState(state);
         return { decision, promptTokens: 0, completionTokens: 0 };
       }
@@ -152,7 +156,8 @@ export class ModelGateway {
         completionTokens
       };
     } catch (err: any) {
-      logger.error({ err }, "Gemini API call failed, falling back to mock mode");
+      logger.error({ err }, "Gemini API call failed");
+      if (!config.isDemoMode) throw err;
       const decision = this.getMockDecisionForState(state);
       return { decision, promptTokens: 0, completionTokens: 0 };
     }

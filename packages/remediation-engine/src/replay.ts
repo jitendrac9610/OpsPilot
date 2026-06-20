@@ -2,7 +2,7 @@ import { logger } from "@opspilot/shared";
 import { WorkflowDrivers } from "@opspilot/workflow-engine";
 
 export class WorkflowReplayer {
-  private drivers = new WorkflowDrivers();
+  constructor(private readonly drivers = new WorkflowDrivers()) {}
 
   public async replay(
     workflowSteps: any[]
