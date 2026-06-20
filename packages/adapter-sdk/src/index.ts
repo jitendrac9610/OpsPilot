@@ -1,0 +1,52 @@
+import { AdapterRegistry } from "./registry.js";
+import { TypeScriptAdapter } from "./adapters/typescript.js";
+import { NodeAdapter } from "./adapters/node.js";
+import { ExpressAdapter } from "./adapters/express.js";
+import { NextAdapter } from "./adapters/next.js";
+import { GenericFallbackAdapter } from "./adapters/generic.js";
+import { MongoDBAdapter } from "./adapters/mongodb.js";
+import { PostgreSQLAdapter } from "./adapters/postgres.js";
+import { RedisAdapter } from "./adapters/redis.js";
+import { BullMQAdapter } from "./adapters/bullmq.js";
+import { InngestAdapter } from "./adapters/inngest.js";
+import { ClerkAdapter } from "./adapters/clerk.js";
+import { StripeAdapter } from "./adapters/stripe.js";
+import { GetStreamAdapter } from "./adapters/getstream.js";
+import { DockerAdapter } from "./adapters/docker.js";
+import { KubernetesAdapter } from "./adapters/kubernetes.js";
+
+// Register initial default adapters
+AdapterRegistry.register(new TypeScriptAdapter());
+AdapterRegistry.register(new NodeAdapter());
+AdapterRegistry.register(new ExpressAdapter());
+AdapterRegistry.register(new NextAdapter());
+AdapterRegistry.register(new GenericFallbackAdapter());
+AdapterRegistry.register(new MongoDBAdapter());
+AdapterRegistry.register(new PostgreSQLAdapter());
+AdapterRegistry.register(new RedisAdapter());
+AdapterRegistry.register(new BullMQAdapter());
+AdapterRegistry.register(new InngestAdapter());
+AdapterRegistry.register(new ClerkAdapter());
+AdapterRegistry.register(new StripeAdapter());
+AdapterRegistry.register(new GetStreamAdapter());
+AdapterRegistry.register(new DockerAdapter());
+AdapterRegistry.register(new KubernetesAdapter());
+
+export * from "./types.js";
+export * from "./registry.js";
+export * from "./adapters/typescript.js";
+export * from "./adapters/node.js";
+export * from "./adapters/express.js";
+export * from "./adapters/next.js";
+export * from "./adapters/generic.js";
+export * from "./adapters/mongodb.js";
+export * from "./adapters/postgres.js";
+export * from "./adapters/redis.js";
+export * from "./adapters/bullmq.js";
+export * from "./adapters/inngest.js";
+export * from "./adapters/clerk.js";
+export * from "./adapters/stripe.js";
+export * from "./adapters/getstream.js";
+export * from "./adapters/docker.js";
+export * from "./adapters/kubernetes.js";
+

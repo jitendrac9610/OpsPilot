@@ -1,0 +1,20 @@
+{
+  "name": "@opspilot/connector-github",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "tsc --build --clean"
+  },
+  "dependencies": {
+    "@opspilot/shared": "workspace:*",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.6",
+    "typescript": "^5.4.5",
+    "@types/node": "^20.12.12"
+  }
+}

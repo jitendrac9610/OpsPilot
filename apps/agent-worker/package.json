@@ -1,0 +1,23 @@
+{
+  "name": "@opspilot/agent-worker",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@opspilot/shared": "workspace:*",
+    "@opspilot/schemas": "workspace:*",
+    "@opspilot/database": "workspace:*",
+    "@opspilot/agent-runtime": "workspace:*",
+    "bullmq": "^5.8.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "tsx": "^4.11.0",
+    "@types/node": "^20.12.12"
+  }
+}

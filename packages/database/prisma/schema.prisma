@@ -1,0 +1,758 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ==========================================
+// 1. SaaS & Control Plane Models
+// ==========================================
+
+model User {
+  id            String       @id @default(cuid())
+  email         String       @unique
+  passwordHash  String
+  verified      Boolean      @default(false)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  sessions      Session[]
+  memberships   Membership[]
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  token        String   @unique
+  ipAddress    String?
+  userAgent    String?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Organization {
+  id           String       @id @default(cuid())
+  name         String
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  memberships  Membership[]
+  projects     Project[]
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  organizationId String
+  userId         String
+  roleId         String
+  createdAt      DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           Role         @relation(fields: [roleId], references: [id])
+}
+
+model Role {
+  id          String       @id
+  name        String       @unique
+  description String?
+  permissions Permission[]
+  memberships Membership[]
+}
+
+model Permission {
+  id          String   @id
+  name        String   @unique
+  description String?
+  roles       Role[]
+}
+
+model Project {
+  id             String        @id @default(cuid())
+  organizationId String
+  name           String
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  repositories   Repository[]
+}
+
+model Repository {
+  id                 String              @id @default(cuid())
+  projectId          String
+  name               String
+  gitUrl             String
+  branch             String              @default("main")
+  directory          String              @default("/")
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  project            Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  githubInstallation GitHubInstallation?
+}
+
+model GitHubInstallation {
+  id             String     @id @default(cuid())
+  repositoryId   String     @unique
+  installationId String
+  createdAt      DateTime   @default(now())
+  repository     Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+}
+
+model Integration {
+  id        String   @id @default(cuid())
+  orgId     String
+  provider  String   // e.g. "clerk", "stripe", "inngest", "getstream"
+  config    Json
+  createdAt DateTime @default(now())
+}
+
+model EncryptedSecret {
+  id        String   @id @default(cuid())
+  orgId     String
+  key       String
+  value     String   // Encrypted base64
+  createdAt DateTime @default(now())
+}
+
+model Subscription {
+  id        String   @id @default(cuid())
+  orgId     String   @unique
+  planId    String
+  status    String   // e.g. "active", "canceled", "trialing"
+  endsAt    DateTime?
+  createdAt DateTime @default(now())
+}
+
+model Invoice {
+  id        String   @id @default(cuid())
+  orgId     String
+  amount    Int
+  currency  String   @default("USD")
+  status    String
+  createdAt DateTime @default(now())
+}
+
+model UsageRecord {
+  id        String   @id @default(cuid())
+  orgId     String
+  dimension String   // e.g., "sandbox_minutes", "model_tokens"
+  quantity  Int
+  timestamp DateTime @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  orgId     String
+  userId    String?
+  action    String
+  payload   Json
+  timestamp DateTime @default(now())
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  orgId     String
+  channel   String   // e.g. "email", "slack", "webhook"
+  target    String
+  message   String
+  sent      Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+model FeatureFlag {
+  id          String   @id
+  description String?
+  enabled     Boolean  @default(false)
+}
+
+// ==========================================
+// 2. Repository Intelligence Models
+// ==========================================
+
+model RepositorySnapshot {
+  id           String   @id @default(cuid())
+  repositoryId String
+  commitSha    String
+  archiveUrl   String
+  createdAt    DateTime @default(now())
+}
+
+model RepositoryWorkspace {
+  id           String   @id @default(cuid())
+  repositoryId String
+  name         String
+  path         String
+}
+
+model Application {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  type        String
+}
+
+model Service {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  techStack   Json
+}
+
+model Package {
+  id        String   @id @default(cuid())
+  serviceId String
+  name      String
+  version   String
+}
+
+model RepositoryFile {
+  id         String   @id @default(cuid())
+  snapshotId String
+  path       String
+  hash       String
+}
+
+model Symbol {
+  id     String @id @default(cuid())
+  fileId String
+  name   String
+  kind   String // class, function, method, etc.
+  line   Int
+}
+
+model Reference {
+  id       String @id @default(cuid())
+  symbolId String
+  fileId   String
+  line     Int
+}
+
+model CodeChunk {
+  id         String   @id @default(cuid())
+  fileId     String
+  content    String
+  startLine  Int
+  endLine    Int
+}
+
+model ChunkEmbedding {
+  id        String @id @default(cuid())
+  chunkId   String @unique
+  embedding String // Representing array values as serialized string for Prisma
+}
+
+model GraphNode {
+  id        String @id
+  versionId String
+  type      String
+  name      String
+  metadata  Json
+}
+
+model GraphEdge {
+  id        String @id
+  versionId String
+  source    String
+  target    String
+  type      String
+  evidence  Json
+}
+
+model ArchitectureVersion {
+  id         String   @id @default(cuid())
+  snapshotId String
+  createdAt  DateTime @default(now())
+}
+
+model CapabilityProfile {
+  id         String   @id @default(cuid())
+  snapshotId String   @unique
+  profile    Json
+  createdAt  DateTime @default(now())
+}
+
+model AdapterExecution {
+  id         String   @id @default(cuid())
+  snapshotId String
+  adapterId  String
+  durationMs Int
+  status     String
+  createdAt  DateTime @default(now())
+}
+
+model DocumentationSource {
+  id        String   @id @default(cuid())
+  name      String
+  version   String
+  url       String
+  content   String
+  createdAt DateTime @default(now())
+}
+
+// ==========================================
+// 3. RAG and Agent Models
+// ==========================================
+
+model RetrievalRound {
+  id         String   @id @default(cuid())
+  agentRunId String
+  query      String
+  createdAt  DateTime @default(now())
+}
+
+model RetrievalCandidate {
+  id               String @id @default(cuid())
+  retrievalRoundId String
+  sourceId         String
+  sourceType       String
+  score            Float
+}
+
+model RetrievalQualityAssessment {
+  id               String   @id @default(cuid())
+  retrievalRoundId String   @unique
+  assessment       String   // e.g. SUFFICIENT, WEAK, CONFLICTING
+  reasons          Json
+  createdAt        DateTime @default(now())
+}
+
+model RetrievalFeedback {
+  id          String   @id @default(cuid())
+  candidateId String   @unique
+  useful      Boolean
+  createdAt   DateTime @default(now())
+}
+
+model AgentRun {
+  id            String   @id @default(cuid())
+  workflowRunId String
+  status        String
+  startedAt     DateTime @default(now())
+  completedAt   DateTime?
+}
+
+model AgentStep {
+  id         String   @id @default(cuid())
+  agentRunId String
+  state      String
+  decision   Json
+  timestamp  DateTime @default(now())
+}
+
+model AgentCheckpoint {
+  id         String   @id @default(cuid())
+  agentRunId String
+  state      Json
+  createdAt  DateTime @default(now())
+}
+
+model Plan {
+  id         String   @id @default(cuid())
+  agentRunId String
+  goal       String
+  version    Int
+  createdAt  DateTime @default(now())
+}
+
+model PlanStep {
+  id          String  @id @default(cuid())
+  planId      String
+  index       Int
+  description String
+  status      String  // PENDING, COMPLETED, FAILED
+}
+
+model Hypothesis {
+  id          String @id @default(cuid())
+  agentRunId  String
+  description String
+  confidence  Float
+  status      String // SUPPORTED, CONTRADICTED, NEUTRAL
+}
+
+model Evidence {
+  id           String   @id @default(cuid())
+  agentRunId   String
+  hypothesisId String?
+  type         String
+  payload      Json
+  createdAt    DateTime @default(now())
+}
+
+model ToolCall {
+  id        String   @id @default(cuid())
+  stepId    String
+  toolName  String
+  arguments Json
+  createdAt DateTime @default(now())
+}
+
+model ToolExecutionAttempt {
+  id         String   @id @default(cuid())
+  toolCallId String
+  success    Boolean
+  output     Json
+  createdAt  DateTime @default(now())
+}
+
+model ModelCall {
+  id         String   @id @default(cuid())
+  agentRunId String
+  modelName  String
+  prompt     String
+  response   String
+  createdAt  DateTime @default(now())
+}
+
+model ModelCallAttempt {
+  id          String   @id @default(cuid())
+  modelCallId String
+  error       String
+  createdAt   DateTime @default(now())
+}
+
+model MemoryRecord {
+  id         String   @id @default(cuid())
+  agentRunId String
+  type       String   // working, project, incident, policy
+  content    Json
+  createdAt  DateTime @default(now())
+}
+
+model BudgetRecord {
+  id         String   @id @default(cuid())
+  agentRunId String
+  dimension  String
+  limit      Int
+  used       Int
+}
+
+// ==========================================
+// 4. Runtime & Workflow Models
+// ==========================================
+
+model Sandbox {
+  id         String   @id @default(cuid())
+  snapshotId String
+  status     String
+  createdAt  DateTime @default(now())
+}
+
+model SandboxService {
+  id        String @id @default(cuid())
+  sandboxId String
+  name      String
+  port      Int
+  status    String
+}
+
+model BuildRun {
+  id        String   @id @default(cuid())
+  sandboxId String
+  success   Boolean
+  log       String
+  createdAt DateTime @default(now())
+}
+
+model TestRun {
+  id        String   @id @default(cuid())
+  sandboxId String
+  type      String   // unit, integration, e2e
+  success   Boolean
+  log       String
+  createdAt DateTime @default(now())
+}
+
+model LoadTestRun {
+  id         String   @id @default(cuid())
+  sandboxId  String
+  throughput Float
+  latencyP95 Float
+  errorRate  Float
+  createdAt  DateTime @default(now())
+}
+
+model FailureInjection {
+  id        String   @id @default(cuid())
+  sandboxId String
+  type      String
+  config    Json
+  createdAt DateTime @default(now())
+}
+
+model SyntheticWorkflow {
+  id          String   @id @default(cuid())
+  projectId   String
+  name        String
+  description String?
+  steps       Json
+  createdAt   DateTime @default(now())
+}
+
+model WorkflowVersion {
+  id         String   @id @default(cuid())
+  workflowId String
+  version    Int
+  definition Json
+}
+
+model WorkflowStep {
+  id         String @id @default(cuid())
+  workflowId String
+  name       String
+  type       String
+  config     Json
+}
+
+model WorkflowRun {
+  id            String   @id @default(cuid())
+  workflowId    String
+  status        String
+  correlationId String
+  startedAt     DateTime @default(now())
+  completedAt   DateTime?
+}
+
+model WorkflowStepRun {
+  id            String   @id @default(cuid())
+  workflowRunId String
+  stepId        String
+  status        String
+  logs          String[]
+  error         String?
+}
+
+model WorkflowAssertion {
+  id         String @id @default(cuid())
+  stepId     String
+  type       String
+  expression String
+}
+
+model WorkflowFixture {
+  id         String @id @default(cuid())
+  workflowId String
+  name       String
+  value      Json
+}
+
+model WorkflowCorrelation {
+  id            String @id @default(cuid())
+  workflowRunId String
+  traceId       String
+}
+
+model FailureBoundary {
+  id            String   @id @default(cuid())
+  workflowRunId String
+  failedStage   String
+  reason        String
+  createdAt     DateTime @default(now())
+}
+
+model Artifact {
+  id        String   @id @default(cuid())
+  runId     String
+  type      String   // build_log, test_report, capture
+  url       String
+  createdAt DateTime @default(now())
+}
+
+// ==========================================
+// 5. Repair & Approval Models
+// ==========================================
+
+model Diagnosis {
+  id            String   @id @default(cuid())
+  agentRunId    String
+  content       Json
+  confidence    Float
+  createdAt     DateTime @default(now())
+}
+
+model RemediationPlan {
+  id          String   @id @default(cuid())
+  diagnosisId String
+  title       String
+  description String
+  steps       Json
+  status      String
+  createdAt   DateTime @default(now())
+}
+
+model RemediationAlternative {
+  id          String @id @default(cuid())
+  planId      String
+  description String
+  score       Float
+}
+
+model ChangeSet {
+  id                String   @id @default(cuid())
+  remediationPlanId String
+  branchName        String
+  createdAt         DateTime @default(now())
+}
+
+model ChangeSetFile {
+  id          String @id @default(cuid())
+  changeSetId String
+  path        String
+  diff        String
+}
+
+model VerificationPlan {
+  id                String   @id @default(cuid())
+  remediationPlanId String
+  config            Json
+  createdAt         DateTime @default(now())
+}
+
+model VerificationRun {
+  id                 String   @id @default(cuid())
+  verificationPlanId String
+  success            Boolean
+  logs               String
+  createdAt          DateTime @default(now())
+}
+
+model VerificationAssertion {
+  id     String  @id @default(cuid())
+  runId  String
+  name   String
+  passed Boolean
+}
+
+model RiskAssessment {
+  id                String   @id @default(cuid())
+  remediationPlanId String
+  score             Float
+  analysis          String
+  createdAt         DateTime @default(now())
+}
+
+model ApprovalRequest {
+  id                String   @id @default(cuid())
+  remediationPlanId String
+  status            String   // PENDING, APPROVED, REJECTED
+  requestedBy       String
+  approvedBy        String?
+  createdAt         DateTime @default(now())
+}
+
+model ApprovedAction {
+  id         String   @id @default(cuid())
+  requestId  String
+  type       String   // PR_MERGE, INFRA_RESTART, etc.
+  status     String
+  executedAt DateTime @default(now())
+}
+
+model PullRequest {
+  id             String   @id @default(cuid())
+  approvedAction String
+  number         Int
+  url            String
+  createdAt      DateTime @default(now())
+}
+
+model RecoveryMonitor {
+  id         String   @id @default(cuid())
+  actionId   String   @unique
+  status     String
+  logs       String
+  createdAt  DateTime @default(now())
+}
+
+model RollbackExecution {
+  id         String   @id @default(cuid())
+  monitorId  String
+  success    Boolean
+  logs       String
+  createdAt  DateTime @default(now())
+}
+
+// ==========================================
+// 6. Production Incidents Models
+// ==========================================
+
+model TelemetrySource {
+  id        String   @id @default(cuid())
+  orgId     String
+  type      String   // otel, datadog, newrelic
+  config    Json
+  createdAt DateTime @default(now())
+}
+
+model Incident {
+  id              String   @id @default(cuid())
+  title           String
+  severity        String
+  status          String
+  firstDetectedAt DateTime @default(now())
+  resolvedAt      DateTime?
+}
+
+model IncidentEvent {
+  id         String   @id @default(cuid())
+  incidentId String
+  type       String
+  message    String
+  timestamp  DateTime @default(now())
+}
+
+model IncidentService {
+  id         String @id @default(cuid())
+  incidentId String
+  serviceId  String
+}
+
+model AlertRule {
+  id          String @id @default(cuid())
+  projectId   String
+  metricName  String
+  threshold   Float
+  durationMs  Int
+}
+
+model DeploymentEvent {
+  id           String   @id @default(cuid())
+  repositoryId String
+  commitSha    String
+  environment  String
+  createdAt    DateTime @default(now())
+}
+
+model RemediationAction {
+  id         String   @id @default(cuid())
+  incidentId String
+  type       String
+  status     String
+  executedAt DateTime @default(now())
+}
+
+model Postmortem {
+  id         String   @id @default(cuid())
+  incidentId String   @unique
+  summary    String
+  rootCause  String
+  timeline   Json
+  actions    Json
+  createdAt  DateTime @default(now())
+}
+
+model Finding {
+  id           String   @id @default(cuid())
+  repositoryId String
+  severity     String   // CRITICAL, HIGH, MEDIUM, LOW
+  confidence   Float
+  title        String
+  file         String
+  line         Int
+  description  String
+  impact       String
+  category     String
+  createdAt    DateTime @default(now())
+}
+

@@ -1,0 +1,27 @@
+{
+  "name": "opspilot-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpsPilot AI v4 — Complete Software Reliability Platform",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "clean": "turbo run clean && pnpm -r exec rm -rf node_modules dist",
+    "quality-gate": "npx tsx scripts/quality-gate.ts",
+    "vertical-slice": "npx tsx scripts/vertical-slice.ts"
+  },
+  "devDependencies": {
+    "turbo": "^1.13.0",
+    "typescript": "^5.4.5",
+    "@opspilot/database": "workspace:*",
+    "@opspilot/shared": "workspace:*",
+    "@opspilot/repository-intelligence": "workspace:*",
+    "@opspilot/workflow-engine": "workspace:*",
+    "dotenv": "^16.4.5",
+    "bcrypt": "^5.1.1",
+    "@types/bcrypt": "^5.0.2"
+  },
+  "packageManager": "pnpm@9.1.4"
+}
