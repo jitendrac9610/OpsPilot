@@ -12,34 +12,34 @@ generator client {
 // ==========================================
 
 model User {
-  id            String       @id @default(cuid())
-  email         String       @unique
-  passwordHash  String
-  verified      Boolean      @default(false)
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
-  sessions      Session[]
-  memberships   Membership[]
+  id           String       @id @default(cuid())
+  email        String       @unique
+  passwordHash String
+  verified     Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  sessions     Session[]
+  memberships  Membership[]
 }
 
 model Session {
-  id           String   @id @default(cuid())
-  userId       String
-  token        String   @unique
-  ipAddress    String?
-  userAgent    String?
-  expiresAt    DateTime
-  createdAt    DateTime @default(now())
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  ipAddress String?
+  userAgent String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model Organization {
-  id           String       @id @default(cuid())
-  name         String
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
-  memberships  Membership[]
-  projects     Project[]
+  id          String       @id @default(cuid())
+  name        String
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  memberships Membership[]
+  projects    Project[]
 }
 
 model Membership {
@@ -62,33 +62,34 @@ model Role {
 }
 
 model Permission {
-  id          String   @id
-  name        String   @unique
+  id          String  @id
+  name        String  @unique
   description String?
   roles       Role[]
 }
 
 model Project {
-  id             String        @id @default(cuid())
+  id             String       @id @default(cuid())
   organizationId String
   name           String
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
-  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   repositories   Repository[]
 }
 
 model Repository {
-  id                 String              @id @default(cuid())
+  id                 String               @id @default(cuid())
   projectId          String
   name               String
   gitUrl             String
-  branch             String              @default("main")
-  directory          String              @default("/")
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
-  project            Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  branch             String               @default("main")
+  directory          String               @default("/")
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  project            Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
   githubInstallation GitHubInstallation?
+  snapshots          RepositorySnapshot[]
 }
 
 model GitHubInstallation {
@@ -102,7 +103,7 @@ model GitHubInstallation {
 model Integration {
   id        String   @id @default(cuid())
   orgId     String
-  provider  String   // e.g. "clerk", "stripe", "inngest", "getstream"
+  provider  String // e.g. "clerk", "stripe", "inngest", "getstream"
   config    Json
   createdAt DateTime @default(now())
 }
@@ -111,17 +112,17 @@ model EncryptedSecret {
   id        String   @id @default(cuid())
   orgId     String
   key       String
-  value     String   // Encrypted base64
+  value     String // Encrypted base64
   createdAt DateTime @default(now())
 }
 
 model Subscription {
-  id        String   @id @default(cuid())
-  orgId     String   @unique
+  id        String    @id @default(cuid())
+  orgId     String    @unique
   planId    String
-  status    String   // e.g. "active", "canceled", "trialing"
+  status    String // e.g. "active", "canceled", "trialing"
   endsAt    DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 }
 
 model Invoice {
@@ -136,7 +137,7 @@ model Invoice {
 model UsageRecord {
   id        String   @id @default(cuid())
   orgId     String
-  dimension String   // e.g., "sandbox_minutes", "model_tokens"
+  dimension String // e.g., "sandbox_minutes", "model_tokens"
   quantity  Int
   timestamp DateTime @default(now())
 }
@@ -153,7 +154,7 @@ model AuditLog {
 model Notification {
   id        String   @id @default(cuid())
   orgId     String
-  channel   String   // e.g. "email", "slack", "webhook"
+  channel   String // e.g. "email", "slack", "webhook"
   target    String
   message   String
   sent      Boolean  @default(false)
@@ -161,9 +162,9 @@ model Notification {
 }
 
 model FeatureFlag {
-  id          String   @id
+  id          String  @id
   description String?
-  enabled     Boolean  @default(false)
+  enabled     Boolean @default(false)
 }
 
 // ==========================================
@@ -171,43 +172,47 @@ model FeatureFlag {
 // ==========================================
 
 model RepositorySnapshot {
-  id           String   @id @default(cuid())
+  id           String     @id @default(cuid())
   repositoryId String
   commitSha    String
   archiveUrl   String
-  createdAt    DateTime @default(now())
+  createdAt    DateTime   @default(now())
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  sandboxes    Sandbox[]
+
+  @@index([repositoryId, createdAt])
 }
 
 model RepositoryWorkspace {
-  id           String   @id @default(cuid())
+  id           String @id @default(cuid())
   repositoryId String
   name         String
   path         String
 }
 
 model Application {
-  id          String   @id @default(cuid())
+  id          String @id @default(cuid())
   workspaceId String
   name        String
   type        String
 }
 
 model Service {
-  id          String   @id @default(cuid())
+  id          String @id @default(cuid())
   workspaceId String
   name        String
   techStack   Json
 }
 
 model Package {
-  id        String   @id @default(cuid())
+  id        String @id @default(cuid())
   serviceId String
   name      String
   version   String
 }
 
 model RepositoryFile {
-  id         String   @id @default(cuid())
+  id         String @id @default(cuid())
   snapshotId String
   path       String
   hash       String
@@ -229,11 +234,11 @@ model Reference {
 }
 
 model CodeChunk {
-  id         String   @id @default(cuid())
-  fileId     String
-  content    String
-  startLine  Int
-  endLine    Int
+  id        String @id @default(cuid())
+  fileId    String
+  content   String
+  startLine Int
+  endLine   Int
 }
 
 model ChunkEmbedding {
@@ -312,7 +317,7 @@ model RetrievalCandidate {
 model RetrievalQualityAssessment {
   id               String   @id @default(cuid())
   retrievalRoundId String   @unique
-  assessment       String   // e.g. SUFFICIENT, WEAK, CONFLICTING
+  assessment       String // e.g. SUFFICIENT, WEAK, CONFLICTING
   reasons          Json
   createdAt        DateTime @default(now())
 }
@@ -325,10 +330,10 @@ model RetrievalFeedback {
 }
 
 model AgentRun {
-  id            String   @id @default(cuid())
+  id            String    @id @default(cuid())
   workflowRunId String
   status        String
-  startedAt     DateTime @default(now())
+  startedAt     DateTime  @default(now())
   completedAt   DateTime?
 }
 
@@ -356,11 +361,11 @@ model Plan {
 }
 
 model PlanStep {
-  id          String  @id @default(cuid())
+  id          String @id @default(cuid())
   planId      String
   index       Int
   description String
-  status      String  // PENDING, COMPLETED, FAILED
+  status      String // PENDING, COMPLETED, FAILED
 }
 
 model Hypothesis {
@@ -415,13 +420,13 @@ model ModelCallAttempt {
 model MemoryRecord {
   id         String   @id @default(cuid())
   agentRunId String
-  type       String   // working, project, incident, policy
+  type       String // working, project, incident, policy
   content    Json
   createdAt  DateTime @default(now())
 }
 
 model BudgetRecord {
-  id         String   @id @default(cuid())
+  id         String @id @default(cuid())
   agentRunId String
   dimension  String
   limit      Int
@@ -433,10 +438,13 @@ model BudgetRecord {
 // ==========================================
 
 model Sandbox {
-  id         String   @id @default(cuid())
+  id         String             @id @default(cuid())
   snapshotId String
   status     String
-  createdAt  DateTime @default(now())
+  createdAt  DateTime           @default(now())
+  snapshot   RepositorySnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@index([snapshotId])
 }
 
 model SandboxService {
@@ -448,17 +456,20 @@ model SandboxService {
 }
 
 model BuildRun {
-  id        String   @id @default(cuid())
-  sandboxId String
-  success   Boolean
-  log       String
-  createdAt DateTime @default(now())
+  id         String   @id @default(cuid())
+  sandboxId  String
+  success    Boolean
+  command    String?
+  exitCode   Int?
+  durationMs Int?
+  log        String
+  createdAt  DateTime @default(now())
 }
 
 model TestRun {
   id        String   @id @default(cuid())
   sandboxId String
-  type      String   // unit, integration, e2e
+  type      String // unit, integration, e2e
   success   Boolean
   log       String
   createdAt DateTime @default(now())
@@ -491,7 +502,7 @@ model SyntheticWorkflow {
 }
 
 model WorkflowVersion {
-  id         String   @id @default(cuid())
+  id         String @id @default(cuid())
   workflowId String
   version    Int
   definition Json
@@ -506,11 +517,11 @@ model WorkflowStep {
 }
 
 model WorkflowRun {
-  id            String   @id @default(cuid())
+  id            String    @id @default(cuid())
   workflowId    String
   status        String
   correlationId String
-  startedAt     DateTime @default(now())
+  startedAt     DateTime  @default(now())
   completedAt   DateTime?
 }
 
@@ -554,7 +565,7 @@ model FailureBoundary {
 model Artifact {
   id        String   @id @default(cuid())
   runId     String
-  type      String   // build_log, test_report, capture
+  type      String // build_log, test_report, capture
   url       String
   createdAt DateTime @default(now())
 }
@@ -564,11 +575,11 @@ model Artifact {
 // ==========================================
 
 model Diagnosis {
-  id            String   @id @default(cuid())
-  agentRunId    String
-  content       Json
-  confidence    Float
-  createdAt     DateTime @default(now())
+  id         String   @id @default(cuid())
+  agentRunId String
+  content    Json
+  confidence Float
+  createdAt  DateTime @default(now())
 }
 
 model RemediationPlan {
@@ -635,7 +646,7 @@ model RiskAssessment {
 model ApprovalRequest {
   id                String   @id @default(cuid())
   remediationPlanId String
-  status            String   // PENDING, APPROVED, REJECTED
+  status            String // PENDING, APPROVED, REJECTED
   requestedBy       String
   approvedBy        String?
   createdAt         DateTime @default(now())
@@ -644,7 +655,7 @@ model ApprovalRequest {
 model ApprovedAction {
   id         String   @id @default(cuid())
   requestId  String
-  type       String   // PR_MERGE, INFRA_RESTART, etc.
+  type       String // PR_MERGE, INFRA_RESTART, etc.
   status     String
   executedAt DateTime @default(now())
 }
@@ -658,19 +669,19 @@ model PullRequest {
 }
 
 model RecoveryMonitor {
-  id         String   @id @default(cuid())
-  actionId   String   @unique
-  status     String
-  logs       String
-  createdAt  DateTime @default(now())
+  id        String   @id @default(cuid())
+  actionId  String   @unique
+  status    String
+  logs      String
+  createdAt DateTime @default(now())
 }
 
 model RollbackExecution {
-  id         String   @id @default(cuid())
-  monitorId  String
-  success    Boolean
-  logs       String
-  createdAt  DateTime @default(now())
+  id        String   @id @default(cuid())
+  monitorId String
+  success   Boolean
+  logs      String
+  createdAt DateTime @default(now())
 }
 
 // ==========================================
@@ -680,17 +691,17 @@ model RollbackExecution {
 model TelemetrySource {
   id        String   @id @default(cuid())
   orgId     String
-  type      String   // otel, datadog, newrelic
+  type      String // otel, datadog, newrelic
   config    Json
   createdAt DateTime @default(now())
 }
 
 model Incident {
-  id              String   @id @default(cuid())
+  id              String    @id @default(cuid())
   title           String
   severity        String
   status          String
-  firstDetectedAt DateTime @default(now())
+  firstDetectedAt DateTime  @default(now())
   resolvedAt      DateTime?
 }
 
@@ -709,11 +720,11 @@ model IncidentService {
 }
 
 model AlertRule {
-  id          String @id @default(cuid())
-  projectId   String
-  metricName  String
-  threshold   Float
-  durationMs  Int
+  id         String @id @default(cuid())
+  projectId  String
+  metricName String
+  threshold  Float
+  durationMs Int
 }
 
 model DeploymentEvent {
@@ -745,7 +756,7 @@ model Postmortem {
 model Finding {
   id           String   @id @default(cuid())
   repositoryId String
-  severity     String   // CRITICAL, HIGH, MEDIUM, LOW
+  severity     String // CRITICAL, HIGH, MEDIUM, LOW
   confidence   Float
   title        String
   file         String
@@ -755,4 +766,3 @@ model Finding {
   category     String
   createdAt    DateTime @default(now())
 }
-

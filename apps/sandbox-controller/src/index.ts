@@ -3,6 +3,9 @@ import { Server } from "node:http";
 import { logger } from "@opspilot/shared";
 import { SandboxManager, SandboxProvisionError } from "./sandbox.js";
 import { DependencyResolver } from "./dependencyResolver.js";
+import { BuildRunner } from "./buildRunner.js";
+import { DependencyServiceManager } from "./dependencyServices.js";
+import { RuntimeLifecycleError, RuntimeLifecycleManager } from "./runtimeLifecycle.js";
 import { ServiceStartupManager } from "./serviceStartup.js";
 import { TestRunner } from "./testRunner.js";
 import { CleanupManager } from "./cleanup.js";
@@ -12,9 +15,19 @@ app.use(express.json({ limit: "256kb" }));
 
 const sandboxManager = new SandboxManager();
 const dependencyResolver = new DependencyResolver();
+const buildRunner = new BuildRunner();
+const dependencyServiceManager = new DependencyServiceManager();
 const serviceStartupManager = new ServiceStartupManager();
 const testRunner = new TestRunner();
 const cleanupManager = new CleanupManager();
+const runtimeLifecycleManager = new RuntimeLifecycleManager(
+  sandboxManager,
+  dependencyResolver,
+  buildRunner,
+  dependencyServiceManager,
+  serviceStartupManager,
+  testRunner
+);
 
 app.post("/api/sandboxes", async (req, res) => {
   try {
@@ -42,7 +55,7 @@ app.post("/api/sandboxes", async (req, res) => {
   }
 });
 
-app.post("/api/sandboxes/:id/build", async (req, res) => {
+app.post("/api/sandboxes/:id/install", async (req, res) => {
   try {
     const sandboxId = req.params.id;
     const manifest = sandboxManager.getWorkspaceManifest(sandboxId);
@@ -53,6 +66,52 @@ app.post("/api/sandboxes/:id/build", async (req, res) => {
   } catch (error) {
     logger.error({ error }, "Dependency installation failed");
     return res.status(500).json({ error: "DEPENDENCY_INSTALL_FAILED", message: "Dependency installation failed." });
+  }
+});
+
+app.post("/api/sandboxes/:id/build", async (req, res) => {
+  try {
+    const sandboxId = req.params.id;
+    const manifest = sandboxManager.getWorkspaceManifest(sandboxId);
+    await sandboxManager.updateStatus(sandboxId, "BUILDING_APPLICATION");
+    const result = await buildRunner.build(sandboxId, manifest.repositoryRoot, manifest.execution);
+    await sandboxManager.updateStatus(sandboxId, result.success ? "BUILD_SUCCEEDED" : "BUILD_FAILED");
+    return res.status(result.success ? 200 : 422).json(result);
+  } catch (error) {
+    logger.error({ error }, "Application build failed");
+    return res.status(500).json({ error: "BUILD_FAILED", message: "Application build failed." });
+  }
+});
+
+app.post("/api/sandboxes/:id/run", async (req, res) => {
+  try {
+    const environment = req.body?.environment;
+    if (environment !== undefined && (
+      typeof environment !== "object" ||
+      environment === null ||
+      Array.isArray(environment) ||
+      Object.values(environment).some((value) => typeof value !== "string")
+    )) {
+      return res.status(400).json({
+        error: "VALIDATION_ERROR",
+        message: "environment must be an object containing string values"
+      });
+    }
+    const result = await runtimeLifecycleManager.run(
+      req.params.id,
+      (environment || {}) as Record<string, string>
+    );
+    return res.status(result.success ? 200 : 422).json(result);
+  } catch (error) {
+    logger.error({ error }, "Runtime lifecycle failed");
+    if (error instanceof RuntimeLifecycleError) {
+      return res.status(422).json({
+        error: error.code,
+        message: error.message,
+        result: error.result
+      });
+    }
+    return res.status(500).json({ error: "RUNTIME_EXECUTION_FAILED", message: "Runtime lifecycle failed." });
   }
 });
 
@@ -115,7 +174,7 @@ app.delete("/api/sandboxes/:id", async (req, res) => {
     const sandboxId = req.params.id;
     const workspaceDir = sandboxManager.getWorkspaceDir(sandboxId);
     await sandboxManager.updateStatus(sandboxId, "TERMINATING");
-    await serviceStartupManager.stopAll(sandboxId);
+    await runtimeLifecycleManager.cleanupRuntime(sandboxId);
     await cleanupManager.deleteWorkspaceDir(workspaceDir);
     await sandboxManager.updateStatus(sandboxId, "DESTROYED");
     return res.json({ success: true, message: `Sandbox ${sandboxId} destroyed.` });
@@ -135,6 +194,9 @@ export * from "./sandbox.js";
 export * from "./executionManifest.js";
 export * from "./containerRunner.js";
 export * from "./dependencyResolver.js";
+export * from "./buildRunner.js";
+export * from "./dependencyServices.js";
+export * from "./runtimeLifecycle.js";
 export * from "./serviceStartup.js";
 export * from "./telemetry.js";
 export * from "./testRunner.js";

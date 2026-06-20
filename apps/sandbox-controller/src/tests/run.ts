@@ -12,6 +12,9 @@ import { DependencyResolver } from "../dependencyResolver.js";
 import { ServiceStartupManager } from "../serviceStartup.js";
 import { TestRunner } from "../testRunner.js";
 import { CleanupManager } from "../cleanup.js";
+import { BuildRunner } from "../buildRunner.js";
+import { DependencyServiceManager } from "../dependencyServices.js";
+import { RuntimeLifecycleManager } from "../runtimeLifecycle.js";
 
 class FakeContainerRunner extends ContainerRunner {
   public override async run(_options: ContainerRunOptions): Promise<ContainerRunResult> {
@@ -20,17 +23,29 @@ class FakeContainerRunner extends ContainerRunner {
 
   public override async startDetached(
     _options: ContainerRunOptions & { ports?: number[] }
-  ): Promise<ContainerRunResult & { containerId?: string }> {
+  ): Promise<ContainerRunResult & { containerId?: string; portBindings: any[] }> {
     return {
       success: true,
       exitCode: 0,
       log: "container-fixture",
       timedOut: false,
-      containerId: "container-fixture"
+      containerId: "container-fixture",
+      portBindings: (_options.ports || []).map((port) => ({
+        containerPort: port,
+        hostPort: 49_173,
+        internalUrl: `http://application:${port}`,
+        externalUrl: "http://127.0.0.1:49173"
+      }))
     };
   }
 
   public override async stop(_containerId: string): Promise<void> {}
+  public override async createNetwork(_sandboxId: string): Promise<string> { return "opspilot-test"; }
+  public override async removeNetwork(_networkName: string): Promise<void> {}
+  public override async cleanupSandboxResources(_sandboxId: string): Promise<void> {}
+  public override async exec(_containerId: string, _command: string[]): Promise<ContainerRunResult> {
+    return { success: true, exitCode: 0, log: "ready", timedOut: false };
+  }
 }
 
 async function runTests() {
@@ -41,7 +56,7 @@ async function runTests() {
     path.join(repositoryRoot, "package.json"),
     JSON.stringify({
       scripts: { start: "node index.js", test: "node --test", build: "tsc" },
-      dependencies: { express: "1.0.0", pg: "1.0.0" }
+      dependencies: { express: "1.0.0", pg: "1.0.0", "@prisma/client": "1.0.0" }
     })
   );
   await fs.promises.writeFile(path.join(repositoryRoot, "package-lock.json"), "{}");
@@ -50,6 +65,8 @@ async function runTests() {
   assert.deepStrictEqual(manifest.installCommand, ["npm", "ci"]);
   assert.strictEqual(manifest.testCommands[0].type, "unit");
   assert.strictEqual(manifest.services[0].type, "postgresql");
+  assert.deepStrictEqual(manifest.migrationCommand, ["npm", "exec", "--", "prisma", "migrate", "deploy"]);
+  assert.strictEqual(manifest.supported, true);
 
   const failingManager = new SandboxManager({
     baseDir: tempRoot,
@@ -95,18 +112,40 @@ async function runTests() {
   const dependencyResult = await new DependencyResolver(true, runner).resolve(repositoryRoot, "sb-test", manifest);
   assert.strictEqual(dependencyResult.success, true);
 
+  const buildResult = await new BuildRunner(true, runner).build("sb-test", repositoryRoot, manifest);
+  assert.strictEqual(buildResult.success, true);
+  assert.deepStrictEqual(buildResult.command, ["npm", "run", "build"]);
+
   const testResult = await new TestRunner(true, runner).runTests("sb-test", repositoryRoot, "unit", manifest);
   assert.strictEqual(testResult.success, true);
 
-  const serviceManager = new ServiceStartupManager(true, runner);
+  const serviceManager = new ServiceStartupManager(true, runner, async () => true);
   const serviceResult = await serviceManager.startService(
     "sb-test",
     repositoryRoot,
-    { id: "app", name: "app", command: ["npm", "start"] }
+    { id: "app", name: "app", command: ["npm", "start"], port: 3000 }
   );
   assert.strictEqual(serviceResult.success, true);
   assert.deepStrictEqual(serviceManager.getActiveContainers("sb-test"), ["container-fixture"]);
   await serviceManager.stopAll("sb-test");
+
+  const lifecycleServiceManager = new ServiceStartupManager(true, runner, async () => true);
+  const lifecycle = new RuntimeLifecycleManager(
+    hydratedManager,
+    new DependencyResolver(true, runner),
+    new BuildRunner(true, runner),
+    new DependencyServiceManager(true, runner),
+    lifecycleServiceManager,
+    new TestRunner(true, runner),
+    runner,
+    async () => ({ status: 200, body: "healthy" })
+  );
+  const lifecycleResult = await lifecycle.run(hydratedSandboxId);
+  assert.strictEqual(lifecycleResult.success, true);
+  assert.strictEqual(lifecycleResult.status, "RUNTIME_VERIFIED");
+  assert.strictEqual(lifecycleResult.endpoints[0].hostPort, 49_173);
+  assert.ok(lifecycleResult.stages.some((stage) => stage.stage === "workflow:http-health"));
+  await lifecycle.cleanupRuntime(hydratedSandboxId);
 
   await new CleanupManager().deleteWorkspaceDir(tempRoot);
   assert.strictEqual(fs.existsSync(tempRoot), false);

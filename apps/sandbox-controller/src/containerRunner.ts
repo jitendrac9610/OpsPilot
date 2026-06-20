@@ -5,11 +5,15 @@ import { config, logger } from "@opspilot/shared";
 
 export interface ContainerRunOptions {
   sandboxId: string;
-  workspaceDir: string;
+  workspaceDir?: string;
   command: string[];
   allowNetwork?: boolean;
+  network?: string;
+  networkAliases?: string[];
   environment?: Record<string, string>;
   timeoutMs?: number;
+  image?: string;
+  user?: string | null;
 }
 
 export interface ContainerRunResult {
@@ -17,6 +21,13 @@ export interface ContainerRunResult {
   exitCode: number | null;
   log: string;
   timedOut: boolean;
+}
+
+export interface PortBinding {
+  containerPort: number;
+  hostPort: number;
+  internalUrl: string;
+  externalUrl: string;
 }
 
 export class ContainerRunner {
@@ -27,18 +38,18 @@ export class ContainerRunner {
       "run",
       "--rm",
       "--name", containerName,
+      "--label", `opspilot.sandbox=${options.sandboxId}`,
       "--init",
       "--cap-drop=ALL",
       "--security-opt", "no-new-privileges",
       "--pids-limit", String(config.sandbox.pidLimit),
       "--memory", config.sandbox.memoryLimit,
       "--cpus", config.sandbox.cpuLimit,
-      "--user", "1000:1000",
-      "--workdir", "/workspace",
-      "--mount", `type=bind,source=${path.resolve(options.workspaceDir)},target=/workspace`,
-      "--network", options.allowNetwork ? "bridge" : "none",
+      ...this.userArgs(options.user),
+      ...this.workspaceArgs(options.workspaceDir),
+      "--network", options.network || (options.allowNetwork ? "bridge" : "none"),
       ...this.environmentArgs(options.environment),
-      config.sandbox.image,
+      options.image || config.sandbox.image,
       ...options.command
     ];
 
@@ -47,35 +58,94 @@ export class ContainerRunner {
     return result;
   }
 
-  public async startDetached(options: ContainerRunOptions & { ports?: number[] }): Promise<ContainerRunResult & { containerId?: string }> {
+  public async startDetached(
+    options: ContainerRunOptions & { ports?: number[] }
+  ): Promise<ContainerRunResult & { containerId?: string; portBindings: PortBinding[] }> {
     this.validateCommand(options.command);
     const containerName = this.containerName(options.sandboxId, options.command[0]);
-    const portArgs = (options.ports || []).flatMap((port) => ["--publish", `${port}:${port}`]);
+    const portArgs = (options.ports || []).flatMap((port) => ["--publish", `127.0.0.1::${port}`]);
     const args = [
       "run",
       "--detach",
       "--rm",
       "--name", containerName,
+      "--label", `opspilot.sandbox=${options.sandboxId}`,
       "--init",
       "--cap-drop=ALL",
       "--security-opt", "no-new-privileges",
       "--pids-limit", String(config.sandbox.pidLimit),
       "--memory", config.sandbox.memoryLimit,
       "--cpus", config.sandbox.cpuLimit,
-      "--user", "1000:1000",
-      "--workdir", "/workspace",
-      "--mount", `type=bind,source=${path.resolve(options.workspaceDir)},target=/workspace`,
-      "--network", options.allowNetwork ? "bridge" : "none",
+      ...this.userArgs(options.user),
+      ...this.workspaceArgs(options.workspaceDir),
+      "--network", options.network || (options.allowNetwork ? "bridge" : "none"),
+      ...(options.networkAliases || []).flatMap((alias) => ["--network-alias", alias]),
       ...portArgs,
       ...this.environmentArgs(options.environment),
-      config.sandbox.image,
+      options.image || config.sandbox.image,
       ...options.command
     ];
     const result = await this.executeDocker(args, options.timeoutMs || 30_000);
+    const containerId = result.success ? result.log.trim().split(/\s/)[0] : undefined;
+    let portBindings: PortBinding[] = [];
+    if (containerId) {
+      try {
+        portBindings = await Promise.all(
+          (options.ports || []).map((port) =>
+            this.inspectPort(containerId, port, options.networkAliases?.[0])
+          )
+        );
+      } catch (error) {
+        await this.stop(containerId).catch(() => undefined);
+        return {
+          ...result,
+          success: false,
+          log: `${result.log}\n${error instanceof Error ? error.message : String(error)}`,
+          containerId: undefined,
+          portBindings: []
+        };
+      }
+    }
     return {
       ...result,
-      containerId: result.success ? result.log.trim().split(/\s/)[0] : undefined
+      containerId,
+      portBindings
     };
+  }
+
+  public async createNetwork(sandboxId: string): Promise<string> {
+    const networkName = this.networkName(sandboxId);
+    const result = await this.executeDocker(
+      ["network", "create", "--driver", "bridge", "--label", `opspilot.sandbox=${sandboxId}`, networkName],
+      15_000
+    );
+    if (!result.success) {
+      throw new Error(`SANDBOX_NETWORK_CREATE_FAILED: ${result.log}`);
+    }
+    return networkName;
+  }
+
+  public async removeNetwork(networkName: string): Promise<void> {
+    await this.executeDocker(["network", "rm", networkName], 15_000);
+  }
+
+  public async cleanupSandboxResources(sandboxId: string): Promise<void> {
+    const listed = await this.executeDocker(
+      ["ps", "--all", "--quiet", "--filter", `label=opspilot.sandbox=${sandboxId}`],
+      15_000
+    );
+    const containerIds = listed.success ? listed.log.trim().split(/\s+/).filter(Boolean) : [];
+    await Promise.all(containerIds.map((containerId) => this.stop(containerId).catch(() => undefined)));
+    await this.removeNetwork(this.networkName(sandboxId)).catch(() => undefined);
+  }
+
+  public async exec(containerId: string, command: string[], timeoutMs = 10_000): Promise<ContainerRunResult> {
+    this.validateCommand(command);
+    return this.executeDocker(["exec", containerId, ...command], timeoutMs);
+  }
+
+  public async logs(containerId: string): Promise<ContainerRunResult> {
+    return this.executeDocker(["logs", "--tail", "200", containerId], 10_000);
   }
 
   public async stop(containerId: string): Promise<void> {
@@ -97,9 +167,45 @@ export class ContainerRunner {
     });
   }
 
+  private workspaceArgs(workspaceDir?: string): string[] {
+    if (!workspaceDir) return [];
+    return [
+      "--workdir", "/workspace",
+      "--mount", `type=bind,source=${path.resolve(workspaceDir)},target=/workspace`
+    ];
+  }
+
+  private userArgs(user: string | null | undefined): string[] {
+    if (user === null) return [];
+    return ["--user", user || "1000:1000"];
+  }
+
   private containerName(sandboxId: string, suffix: string): string {
     const clean = `${sandboxId}-${suffix}`.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").slice(0, 50);
     return `${clean}-${crypto.randomUUID().slice(0, 8)}`;
+  }
+
+  private networkName(sandboxId: string): string {
+    return `opspilot-${sandboxId}`.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").slice(0, 63);
+  }
+
+  private async inspectPort(containerId: string, containerPort: number, alias = "application"): Promise<PortBinding> {
+    const result = await this.executeDocker(["port", containerId, `${containerPort}/tcp`], 10_000);
+    if (!result.success) {
+      throw new Error(`SANDBOX_PORT_INSPECTION_FAILED: ${result.log}`);
+    }
+    const firstBinding = result.log.trim().split(/\r?\n/)[0] || "";
+    const match = firstBinding.match(/:(\d+)\s*$/);
+    if (!match) {
+      throw new Error(`SANDBOX_PORT_INSPECTION_FAILED: Unexpected Docker port output "${firstBinding}".`);
+    }
+    const hostPort = Number(match[1]);
+    return {
+      containerPort,
+      hostPort,
+      internalUrl: `http://${alias}:${containerPort}`,
+      externalUrl: `http://127.0.0.1:${hostPort}`
+    };
   }
 
   private async forceRemove(containerName: string) {

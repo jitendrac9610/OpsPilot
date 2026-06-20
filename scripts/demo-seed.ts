@@ -7,9 +7,10 @@ import { runStaticAnalysis } from "@opspilot/repository-intelligence";
 import { WorkflowDiscoverer } from "@opspilot/workflow-engine";
 import bcrypt from "bcrypt";
 
-async function runVerticalSlice() {
+async function runDemoSeed() {
   console.log("=========================================================");
-  console.log("🚀 STARTING OPSPILOT AI v4 — FIRST COMPLETE VERTICAL SLICE");
+  console.log("DEMO DATA: Seeding a simulated OpsPilot walkthrough.");
+  console.log("This script does not apply or independently verify a real repository patch.");
   console.log("=========================================================\n");
 
   const orgName = "Vertical Slice Recruiter Org";
@@ -510,13 +511,13 @@ async function runVerticalSlice() {
     console.log(`  ✓ Link: ${pullRequest.url}`);
 
     console.log("\n=========================================================");
-    console.log("🎉 FIRST COMPLETE VERTICAL SLICE EXECUTED & VERIFIED!");
+    console.log("DEMO DATA SEED COMPLETED");
     console.log("=========================================================");
 
   } catch (err: any) {
-    console.error("\n❌ Vertical slice execution failed:", err);
+    console.error("\nDemo data seed failed:", err);
     process.exit(1);
   }
 }
 
-runVerticalSlice().then(() => process.exit(0));
+runDemoSeed().then(() => process.exit(0));

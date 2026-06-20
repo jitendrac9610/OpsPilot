@@ -12,9 +12,12 @@ async function testQualityGate() {
     where: { orgId: "test-org-123" }
   });
 
-  const runQualityGateCmd = () => {
+  const runQualityGateCmd = (extraEnv: Record<string, string> = {}) => {
     try {
-      execSync("npx tsx scripts/quality-gate.ts", { stdio: "inherit", env: process.env });
+      execSync("npx tsx scripts/quality-gate.ts", {
+        stdio: "inherit",
+        env: { ...process.env, ...extraEnv }
+      });
       return 0;
     } catch (err: any) {
       return err.status !== undefined ? err.status : 1;
@@ -34,6 +37,11 @@ async function testQualityGate() {
   const exitCode1 = runQualityGateCmd();
   console.log(`Exit code (Expected 0): ${exitCode1}`);
   if (exitCode1 !== 0) throw new Error("Scenario 1 failed");
+
+  console.log("\n--- Scenario 1b: No Benchmark Logs In CI ---");
+  const exitCode1b = runQualityGateCmd({ CI: "true" });
+  console.log(`Exit code (Expected 1): ${exitCode1b}`);
+  if (exitCode1b !== 1) throw new Error("Scenario 1b failed");
 
   // Scenario 2: Successful Benchmark Log
   console.log("\n--- Scenario 2: Successful Benchmark Log ---");

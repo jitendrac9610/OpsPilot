@@ -1,6 +1,13 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import { config, logger, TenantContextHolder, UnauthorizedError } from "@opspilot/shared";
+import {
+  config,
+  ForbiddenError,
+  logger,
+  OpsPilotError,
+  TenantContextHolder,
+  UnauthorizedError
+} from "@opspilot/shared";
 import { prisma } from "@opspilot/database";
 
 export interface AuthenticatedRequest extends Request {
@@ -37,9 +44,30 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
       email: user.email
     };
 
-    // Extract scoped workspace elements
-    const organizationId = (req.headers["x-organization-id"] as string) || "";
+    // Resolve and verify scoped workspace elements before trusting them.
+    let organizationId = (req.headers["x-organization-id"] as string) || "";
     const projectId = (req.headers["x-project-id"] as string) || "";
+
+    if (projectId) {
+      const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { organizationId: true }
+      });
+      if (!project || (organizationId && project.organizationId !== organizationId)) {
+        return next(new ForbiddenError("Project is not accessible in the requested organization"));
+      }
+      organizationId = project.organizationId;
+    }
+
+    if (organizationId) {
+      const membership = await prisma.membership.findFirst({
+        where: { organizationId, userId: user.id },
+        select: { id: true }
+      });
+      if (!membership) {
+        return next(new ForbiddenError("Active organization membership is required"));
+      }
+    }
 
     if (organizationId) {
       (req as AuthenticatedRequest).organizationId = organizationId;
@@ -61,6 +89,7 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
       }
     );
   } catch (err: any) {
+    if (err instanceof OpsPilotError) return next(err);
     logger.error({ err }, "JWT verification failure");
     return next(new UnauthorizedError("Invalid or expired session token"));
   }

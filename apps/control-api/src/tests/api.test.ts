@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { publicRouter } from "../routes/public.js";
 import { adminRouter } from "../routes/admin.js";
+import { repositoryOwnershipWhere, sandboxOwnershipWhere } from "../routes/sandbox.js";
 import express from "express";
 
 async function runApiTests() {
@@ -44,6 +45,18 @@ async function runApiTests() {
   assert.strictEqual(mockAdminReq.organizationId, "org-123");
   assert.strictEqual(mockAdminReq.user.id, "user-123");
   console.log("✓ Admin request context mapping verified.");
+
+  const repositoryScope = repositoryOwnershipWhere("user-123", "repo-123", "org-123");
+  assert.strictEqual(repositoryScope.project.organizationId, "org-123");
+  assert.strictEqual(repositoryScope.project.organization.memberships.some.userId, "user-123");
+
+  const sandboxScope = sandboxOwnershipWhere("user-123", "sandbox-123", "org-123");
+  assert.strictEqual(sandboxScope.snapshot.repository.project.organizationId, "org-123");
+  assert.strictEqual(
+    sandboxScope.snapshot.repository.project.organization.memberships.some.userId,
+    "user-123"
+  );
+  console.log("✓ Repository and sandbox queries include tenant ownership constraints.");
 
   console.log("\nALL API ROUTE CHECKS PASSED!");
 }

@@ -102,6 +102,7 @@ export default function Dashboard() {
   const [sandboxDetails, setSandboxDetails] = useState<any | null>(null);
   const [loadingSandbox, setLoadingSandbox] = useState<boolean>(false);
   const [runningSandboxTest, setRunningSandboxTest] = useState<boolean>(false);
+  const [runningSandboxLifecycle, setRunningSandboxLifecycle] = useState<boolean>(false);
   const [injectingFailure, setInjectingFailure] = useState<boolean>(false);
   const [runningLoadTest, setRunningLoadTest] = useState<boolean>(false);
   const [sandboxLogs, setSandboxLogs] = useState<string[]>([]);
@@ -155,6 +156,7 @@ export default function Dashboard() {
           `VERIFIED: ${data.manifest?.verifiedFileCount || 0} indexed file hashes matched the hydrated repository.`,
           ...(data.manifest?.execution?.issues || []).map((issue: string) => `CAPABILITY: ${issue}`)
         ]);
+        await runSandboxLifecycle(data.id);
       } else {
         const body = await res.json().catch(() => ({ error: "SANDBOX_PROVISIONING_FAILED", message: res.statusText }));
         setSandboxLogs([`${body.error}: ${body.message}`]);
@@ -170,7 +172,10 @@ export default function Dashboard() {
   const pollSandboxDetails = async (id: string) => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/sandboxes/${id}`, {
-        headers: { "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}` }
+        headers: {
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
+        }
       });
       if (res.ok) {
         const data = await res.json();
@@ -178,6 +183,49 @@ export default function Dashboard() {
       }
     } catch (err) {
       console.error("Error polling sandbox status", err);
+    }
+  };
+
+  const runSandboxLifecycle = async (sandboxId = activeSandboxId) => {
+    if (!sandboxId) return;
+    setRunningSandboxLifecycle(true);
+    setSandboxLogs(prev => [
+      ...prev,
+      "RUNTIME: Provisioning dependencies, installing packages, building, migrating, starting, and verifying health..."
+    ]);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}/run`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
+        },
+        body: JSON.stringify({ environment: {} })
+      });
+      const data = await res.json().catch(() => ({
+        error: "RUNTIME_EXECUTION_FAILED",
+        message: res.statusText,
+        stages: []
+      }));
+      const lifecycleData = data.result || data;
+      setSandboxLogs(prev => [
+        ...prev,
+        ...(lifecycleData.stages || []).map((stage: any) =>
+          `${stage.success ? "PASS" : "FAIL"} ${stage.stage}: ${stage.log || "No log returned."}`
+        ),
+        ...(lifecycleData.endpoints || []).map((endpoint: any) =>
+          `READY: ${endpoint.externalUrl} maps to ${endpoint.internalUrl}`
+        ),
+        lifecycleData.success
+          ? "RUNTIME_VERIFIED: Application health and all configured tests passed."
+          : `${data.error || lifecycleData.status || "RUNTIME_EXECUTION_FAILED"}: ${data.message || "A lifecycle stage failed."}`
+      ]);
+      await pollSandboxDetails(sandboxId);
+    } catch (err: any) {
+      setSandboxLogs(prev => [...prev, `RUNTIME_EXECUTION_FAILED: ${err.message || String(err)}`]);
+    } finally {
+      setRunningSandboxLifecycle(false);
     }
   };
 
@@ -190,7 +238,8 @@ export default function Dashboard() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
         },
         body: JSON.stringify({ type })
       });
@@ -223,7 +272,8 @@ export default function Dashboard() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
         },
         body: JSON.stringify({ type, serviceName })
       });
@@ -255,7 +305,8 @@ export default function Dashboard() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
         }
       });
       if (res.ok) {
@@ -972,101 +1023,63 @@ export default function Dashboard() {
         `✓ Verified ${sandboxData.manifest?.verifiedFileCount || 0} indexed file hashes.`
       ]);
 
-      const buildRes = await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}/build`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${currentToken}`
-        }
-      });
-      if (!buildRes.ok) {
-        const buildFailure = await buildRes.json().catch(() => ({ error: "DEPENDENCY_INSTALL_FAILED", message: buildRes.statusText }));
-        throw new Error(`${buildFailure.error}: ${buildFailure.message || buildFailure.log || "Dependency installation failed"}`);
-      }
-      setScanProgress(prev => [...prev, "✓ Deterministic dependency installation completed in the sandbox container."]);
-
       setScanStepStatuses(prev => ({ ...prev, sandbox: "success", dynamic: "running" }));
       setScanStatus("dynamic_tests");
-      setScanProgress(prev => [...prev, "🧪 Launching dynamic testing verification suites inside sandbox..."]);
-
-      // 7. Run Unit/E2E Tests to identify runtime failures
-      setScanProgress(prev => [...prev, "🧪 Executing unit tests in sandbox container..."]);
-      const unitTestRes = await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}/test`, {
+      setScanProgress(prev => [
+        ...prev,
+        "Starting the managed runtime lifecycle: dependencies, build, migrations, application health, and tests..."
+      ]);
+      const runRes = await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}/run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${currentToken}`
+          "Authorization": `Bearer ${currentToken}`,
+          "x-organization-id": activeOrganizationId || ""
         },
-        body: JSON.stringify({ type: "unit" })
+        body: JSON.stringify({ environment: {} })
       });
-      
-      let unitSuccess = false;
-      let unitLog = "";
-      if (unitTestRes.ok) {
-        const unitData = await unitTestRes.json();
-        unitSuccess = unitData.success;
-        unitLog = unitData.log;
-        const isNotConfigured = unitLog.startsWith("NOT_CONFIGURED");
-        setScanProgress(prev => [
-          ...prev, 
-          unitSuccess 
-            ? "✓ Unit test suite passed!" 
-            : (isNotConfigured ? "ℹ Unit test suite not configured in package.json." : "❌ Unit test failures detected."),
-          `Log Output Summary:\n${unitLog.substring(0, 300)}...`
-        ]);
-      }
+      const runData = await runRes.json().catch(() => ({
+        success: false,
+        error: "RUNTIME_EXECUTION_FAILED",
+        message: runRes.statusText,
+        stages: [],
+        tests: []
+      }));
+      const lifecycleData = runData.result || runData;
+      setScanProgress(prev => [
+        ...prev,
+        ...(lifecycleData.stages || []).map((stage: any) =>
+          `${stage.success ? "PASS" : "FAIL"} ${stage.stage}: ${(stage.log || "").substring(0, 300)}`
+        ),
+        ...(lifecycleData.endpoints || []).map((endpoint: any) =>
+          `Application endpoint ${endpoint.externalUrl} (container ${endpoint.internalUrl}).`
+        )
+      ]);
 
-      setScanProgress(prev => [...prev, "🧪 Executing integration/E2E verification tests in sandbox..."]);
-      const e2eTestRes = await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}/test`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${currentToken}`
-        },
-        body: JSON.stringify({ type: "e2e" })
-      });
-
-      let e2eSuccess = false;
-      let e2eLog = "";
-      if (e2eTestRes.ok) {
-        const e2eData = await e2eTestRes.json();
-        e2eSuccess = e2eData.success;
-        e2eLog = e2eData.log;
-        const isNotConfigured = e2eLog.startsWith("NOT_CONFIGURED");
-        setScanProgress(prev => [
-          ...prev,
-          e2eSuccess 
-            ? "✓ E2E workflow suite passed!" 
-            : (isNotConfigured ? "ℹ E2E workflow suite not configured in package.json." : "❌ E2E workflow failures detected."),
-          `Log Output Summary:\n${e2eLog.substring(0, 300)}...`
-        ]);
-      }
-
-      const dynamicRuns = [];
-      if (unitLog) {
-        const status = unitLog.startsWith("NOT_CONFIGURED") ? "NOT_CONFIGURED" : (unitSuccess ? "PASSED" : "FAILED");
-        dynamicRuns.push({ type: "unit", success: unitSuccess, status, log: unitLog });
-      }
-      if (e2eLog) {
-        const status = e2eLog.startsWith("NOT_CONFIGURED") ? "NOT_CONFIGURED" : (e2eSuccess ? "PASSED" : "FAILED");
-        dynamicRuns.push({ type: "e2e", success: e2eSuccess, status, log: e2eLog });
-      }
+      const dynamicRuns = (lifecycleData.tests || []).map((testRun: any) => ({
+        ...testRun,
+        status: testRun.success ? "PASSED" : "FAILED"
+      }));
       setScanDynamicFindings(dynamicRuns);
+      const runtimeSuccess = runRes.ok && lifecycleData.success;
 
       // Clean up sandbox
       setScanProgress(prev => [...prev, "🧹 Cleaning up sandbox resources..."]);
       await fetch(`${API_BASE_URL}/api/sandboxes/${sandboxId}`, {
         method: "DELETE",
-        headers: { "Authorization": `Bearer ${currentToken}` }
+        headers: {
+          "Authorization": `Bearer ${currentToken}`,
+          "x-organization-id": activeOrganizationId || ""
+        }
       });
 
-      setScanStepStatuses(prev => ({ ...prev, dynamic: unitSuccess && e2eSuccess ? "success" : "failed" }));
+      setScanStepStatuses(prev => ({ ...prev, dynamic: runtimeSuccess ? "success" : "failed" }));
       setScanStatus("completed");
       setScanProgress(prev => [
         ...prev,
-        unitSuccess && e2eSuccess
-          ? "Automated static and dynamic scan completed with all configured tests passing."
-          : "Automated scan completed with dynamic test failures or missing test capabilities."
+        runtimeSuccess
+          ? "Automated static and runtime scan completed with the application healthy and configured tests passing."
+          : `Runtime verification failed: ${runData.error || lifecycleData.status || "one or more lifecycle stages failed"}.`
       ]);
 
       if (activeOrganizationId) {
@@ -2502,6 +2515,14 @@ export default function Dashboard() {
             style={{ padding: "8px 16px", display: "flex", alignItems: "center", gap: "8px" }}
           >
             <RefreshCw size={14} /> Refresh Environment
+          </button>
+          <button
+            onClick={() => runSandboxLifecycle(sandboxDetails.id)}
+            disabled={runningSandboxLifecycle}
+            className="btn-primary"
+            style={{ padding: "8px 16px", display: "flex", alignItems: "center", gap: "8px" }}
+          >
+            <Play size={14} /> {runningSandboxLifecycle ? "Running Lifecycle..." : "Run Application"}
           </button>
         </div>
 

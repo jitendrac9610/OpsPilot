@@ -41,6 +41,7 @@ export interface ExecutionManifest {
   packageManager: PackageManager;
   installCommand: string[];
   buildCommand?: string[];
+  migrationCommand?: string[];
   testCommands: TestCommand[];
   startCommands: ServiceCommand[];
   services: DependencyService[];
@@ -103,6 +104,7 @@ export async function discoverExecutionManifest(repositoryRoot: string): Promise
   }
 
   const services = discoverDependencyServices(dependencies);
+  const migrationCommand = discoverMigrationCommand(packageManager, scripts, dependencies);
   const requiredEnvironment = await discoverEnvironmentRequirements(repositoryRoot);
   const healthChecks = startCommands
     .filter((service): service is ServiceCommand & { port: number } => typeof service.port === "number")
@@ -122,13 +124,23 @@ export async function discoverExecutionManifest(repositoryRoot: string): Promise
   if (startCommands.length === 0) {
     issues.push("START_COMMAND_NOT_CONFIGURED: Neither a start nor dev script was discovered.");
   }
+  if (startCommands.length > 0 && ports.length === 0) {
+    issues.push(
+      "APPLICATION_PORT_NOT_DISCOVERED: Runtime verification requires a declared PORT or a statically discoverable listen port."
+    );
+  }
 
   return {
     version: 1,
-    supported: fs.existsSync(packageJsonPath) && installCommand.length > 0,
+    supported:
+      fs.existsSync(packageJsonPath) &&
+      installCommand.length > 0 &&
+      startCommands.length > 0 &&
+      ports.length > 0,
     packageManager,
     installCommand,
     buildCommand: scripts.build ? commandForScript("build") : undefined,
+    migrationCommand,
     testCommands,
     startCommands,
     services,
@@ -137,6 +149,24 @@ export async function discoverExecutionManifest(repositoryRoot: string): Promise
     requiredEnvironment,
     issues
   };
+}
+
+function discoverMigrationCommand(
+  packageManager: PackageManager,
+  scripts: Record<string, string>,
+  dependencies: Record<string, string>
+): string[] | undefined {
+  const script = scripts["db:migrate"] ? "db:migrate" : scripts.migrate ? "migrate" : undefined;
+  if (script) {
+    return packageManager === "npm"
+      ? ["npm", "run", script]
+      : ["corepack", packageManager, "run", script];
+  }
+  if (dependencies.prisma || dependencies["@prisma/client"]) {
+    if (packageManager === "npm") return ["npm", "exec", "--", "prisma", "migrate", "deploy"];
+    return ["corepack", packageManager, "exec", "prisma", "migrate", "deploy"];
+  }
+  return undefined;
 }
 
 function detectPackageManager(repositoryRoot: string): PackageManager {
@@ -191,6 +221,21 @@ async function discoverPorts(
   }
   if (ports.size === 0 && (dependencies.next || dependencies.express)) {
     ports.add(3000);
+  }
+  if (ports.size === 0) {
+    const files = await listSourceFiles(repositoryRoot, 200);
+    for (const file of files) {
+      const stat = await fs.promises.stat(file).catch(() => null);
+      if (!stat || stat.size > 512 * 1024) continue;
+      const content = await fs.promises.readFile(file, "utf8").catch(() => "");
+      const patterns = [
+        /\.listen\(\s*(\d{2,5})\b/g,
+        /process\.env\.PORT\s*(?:\|\||\?\?)\s*(\d{2,5})\b/g
+      ];
+      for (const pattern of patterns) {
+        for (const match of content.matchAll(pattern)) ports.add(Number(match[1]));
+      }
+    }
   }
   return [...ports];
 }

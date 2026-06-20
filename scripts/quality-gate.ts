@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import { prisma } from "@opspilot/database";
-import { logger } from "@opspilot/shared";
+import { config } from "@opspilot/shared";
 
 async function runQualityGate() {
   console.log("=== OpsPilot Release Quality Gate ===");
@@ -14,8 +14,9 @@ async function runQualityGate() {
     });
 
     if (!latestLog) {
-      console.log("⚠️ No benchmark results found in audit logs. Skipping quality gate check.");
-      process.exit(0);
+      const strictGate = config.opspilotMode === "production" || process.env.CI === "true";
+      console.error("No benchmark results found in audit logs.");
+      process.exit(strictGate ? 1 : 0);
     }
 
     const payload = latestLog.payload as any;

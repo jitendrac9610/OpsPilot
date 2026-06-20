@@ -10,7 +10,7 @@
     "lint": "turbo run lint",
     "clean": "turbo run clean && pnpm -r exec rm -rf node_modules dist",
     "quality-gate": "npx tsx scripts/quality-gate.ts",
-    "vertical-slice": "npx tsx scripts/vertical-slice.ts"
+    "demo-seed": "npx tsx scripts/demo-seed.ts"
   },
   "devDependencies": {
     "turbo": "^1.13.0",

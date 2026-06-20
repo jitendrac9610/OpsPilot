@@ -12,7 +12,8 @@ export class DependencyResolver {
   public async resolve(
     workspaceDir: string,
     sandboxId: string,
-    manifest: ExecutionManifest
+    manifest: ExecutionManifest,
+    network?: string
   ): Promise<{ success: boolean; log: string; exitCode: number | null }> {
     logger.info({ workspaceDir, sandboxId }, "Installing locked dependencies in isolated container");
 
@@ -28,7 +29,8 @@ export class DependencyResolver {
       sandboxId,
       workspaceDir,
       command: manifest.installCommand,
-      allowNetwork: true
+      allowNetwork: !network,
+      network
     });
     return this.persist(sandboxId, {
       success: result.success,
@@ -41,19 +43,6 @@ export class DependencyResolver {
     sandboxId: string,
     result: { success: boolean; log: string; exitCode: number | null }
   ) {
-    if (!this.dbFallback) {
-      try {
-        await prisma.buildRun.create({
-          data: {
-            sandboxId,
-            success: result.success,
-            log: result.log
-          }
-        });
-      } catch (error) {
-        logger.warn({ error }, "Failed to persist dependency installation result");
-      }
-    }
     return result;
   }
 }
