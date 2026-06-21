@@ -15,3 +15,12 @@ coverage/
 sandbox/temp/
 talent-iq2/
 scratch/
+*.tsbuildinfo
+/apps/control-api/src/**/*.js
+/apps/control-api/src/**/*.js.map
+/apps/control-api/src/**/*.d.ts
+/apps/control-api/src/**/*.d.ts.map
+/apps/incident-worker/src/index.js
+/apps/incident-worker/src/index.js.map
+/apps/incident-worker/src/index.d.ts
+/apps/incident-worker/src/index.d.ts.map

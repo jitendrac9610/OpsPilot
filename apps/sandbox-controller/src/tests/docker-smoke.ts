@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { BuildRunner } from "../buildRunner.js";
+import { CleanupManager } from "../cleanup.js";
 import { ContainerRunner } from "../containerRunner.js";
 import { DependencyResolver } from "../dependencyResolver.js";
 import { DependencyServiceManager } from "../dependencyServices.js";
@@ -73,6 +74,7 @@ async function runDockerSmoke() {
   }
 
   await runLifecycleSmoke(runner);
+  await runMultiServiceLifecycleSmoke(runner);
 }
 
 async function runLifecycleSmoke(runner: ContainerRunner) {
@@ -156,7 +158,136 @@ async function runLifecycleSmoke(runner: ContainerRunner) {
     }, null, 2));
   } finally {
     await lifecycle.cleanupRuntime(sandboxId);
-    await fs.promises.rm(root, { recursive: true, force: true });
+    await runner.run({
+      sandboxId: `${sandboxId}-workspace-cleanup`,
+      workspaceDir: repositoryRoot,
+      command: ["rm", "-rf", "node_modules"],
+      user: null
+    }).catch(() => undefined);
+    await new CleanupManager().deleteWorkspaceDir(root);
+  }
+}
+
+async function runMultiServiceLifecycleSmoke(runner: ContainerRunner) {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "opspilot-multi-smoke-"));
+  const sandboxId = `multi-${crypto.randomUUID().slice(0, 8)}`;
+  const workspaceDir = path.join(root, sandboxId);
+  const repositoryRoot = path.join(workspaceDir, "repository");
+  for (const service of ["api", "worker", "web"]) {
+    await fs.promises.mkdir(path.join(repositoryRoot, "apps", service), { recursive: true });
+  }
+
+  await fs.promises.writeFile(path.join(repositoryRoot, "package.json"), JSON.stringify({
+    name: "opspilot-multi-smoke",
+    version: "1.0.0",
+    private: true,
+    workspaces: ["apps/*"]
+  }));
+  await fs.promises.writeFile(path.join(repositoryRoot, "package-lock.json"), JSON.stringify({
+    name: "opspilot-multi-smoke",
+    version: "1.0.0",
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      "": {
+        name: "opspilot-multi-smoke",
+        version: "1.0.0",
+        workspaces: ["apps/*"]
+      },
+      "apps/api": { name: "@smoke/api", version: "1.0.0" },
+      "apps/worker": { name: "@smoke/worker", version: "1.0.0" },
+      "apps/web": { name: "@smoke/web", version: "1.0.0" },
+      "node_modules/@smoke/api": { resolved: "apps/api", link: true },
+      "node_modules/@smoke/worker": { resolved: "apps/worker", link: true },
+      "node_modules/@smoke/web": { resolved: "apps/web", link: true }
+    }
+  }));
+  await fs.promises.writeFile(path.join(repositoryRoot, "apps", "api", "package.json"), JSON.stringify({
+    name: "@smoke/api",
+    version: "1.0.0",
+    scripts: { start: "node server.js", test: "node test.js" }
+  }));
+  await fs.promises.writeFile(
+    path.join(repositoryRoot, "apps", "api", "server.js"),
+    "require('http').createServer((_,res)=>res.end('api-ok')).listen(Number(process.env.PORT||4100),'0.0.0.0');"
+  );
+  await fs.promises.writeFile(
+    path.join(repositoryRoot, "apps", "api", "test.js"),
+    "fetch(`http://127.0.0.1:${process.env.PORT}`).then(r=>r.text()).then(v=>{if(v!=='api-ok')process.exit(1)}).catch(()=>process.exit(1));"
+  );
+  await fs.promises.writeFile(path.join(repositoryRoot, "apps", "worker", "package.json"), JSON.stringify({
+    name: "@smoke/worker",
+    version: "1.0.0",
+    scripts: { start: "node worker.js" }
+  }));
+  await fs.promises.writeFile(
+    path.join(repositoryRoot, "apps", "worker", "worker.js"),
+    "console.log('worker-ready'); setInterval(()=>{},1000);"
+  );
+  await fs.promises.writeFile(path.join(repositoryRoot, "apps", "web", "package.json"), JSON.stringify({
+    name: "@smoke/web",
+    version: "1.0.0",
+    scripts: { start: "node server.js" }
+  }));
+  await fs.promises.writeFile(
+    path.join(repositoryRoot, "apps", "web", "server.js"),
+    "require('http').createServer((_,res)=>res.end(process.env.API_URL?'web-ok':'missing-api')).listen(Number(process.env.PORT||3000),'0.0.0.0');"
+  );
+
+  const execution = await discoverExecutionManifest(repositoryRoot);
+  const workspaceManifest: WorkspaceManifest = {
+    sandboxId,
+    snapshotId: "multi-smoke-snapshot",
+    commitSha: "multi-smoke-commit",
+    repositoryRoot,
+    createdAt: new Date().toISOString(),
+    verifiedFileCount: 0,
+    execution
+  };
+  await fs.promises.writeFile(
+    path.join(workspaceDir, "opspilot-workspace.json"),
+    JSON.stringify(workspaceManifest)
+  );
+
+  const sandboxManager = new SandboxManager({ baseDir: root, persistSandbox: false });
+  const lifecycle = new RuntimeLifecycleManager(
+    sandboxManager,
+    new DependencyResolver(true, runner),
+    new BuildRunner(true, runner),
+    new DependencyServiceManager(true, runner),
+    new ServiceStartupManager(true, runner),
+    new TestRunner(true, runner),
+    runner
+  );
+
+  try {
+    const result = await lifecycle.run(sandboxId);
+    assert.strictEqual(result.success, true);
+    assert.deepStrictEqual(result.services.map((service) => service.kind), ["api", "worker", "frontend"]);
+    assert.strictEqual(result.endpoints.length, 2);
+    assert.notStrictEqual(result.endpoints[0].hostPort, result.endpoints[1].hostPort);
+    assert.strictEqual(Object.keys(result.logs).length, 3);
+    const webEndpoint = result.endpoints.find((endpoint) => endpoint.kind === "frontend");
+    assert.ok(webEndpoint);
+    assert.strictEqual(await fetch(webEndpoint!.externalUrl).then((response) => response.text()), "web-ok");
+    console.log(JSON.stringify({
+      lifecycle: "multi-service-verified",
+      services: result.services.map((service) => ({
+        id: service.serviceId,
+        kind: service.kind,
+        attempts: service.attempts
+      })),
+      endpoints: result.endpoints
+    }, null, 2));
+  } finally {
+    await lifecycle.cleanupRuntime(sandboxId);
+    await runner.run({
+      sandboxId: `${sandboxId}-workspace-cleanup`,
+      workspaceDir: repositoryRoot,
+      command: ["rm", "-rf", "node_modules"],
+      user: null
+    }).catch(() => undefined);
+    await new CleanupManager().deleteWorkspaceDir(root);
   }
 }
 

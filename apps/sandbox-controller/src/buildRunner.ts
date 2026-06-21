@@ -6,6 +6,13 @@ import { ExecutionManifest } from "./executionManifest.js";
 export interface BuildResult {
   success: boolean;
   command: string[];
+  commands?: Array<{
+    id: string;
+    command: string[];
+    workingDirectory: string;
+    success: boolean;
+    exitCode: number | null;
+  }>;
   exitCode: number | null;
   durationMs: number;
   log: string;
@@ -24,7 +31,12 @@ export class BuildRunner {
     network?: string,
     environment: Record<string, string> = {}
   ): Promise<BuildResult> {
-    if (!manifest.buildCommand) {
+    const commands = manifest.buildCommands?.length
+      ? manifest.buildCommands
+      : manifest.buildCommand
+        ? [{ id: "build:root", command: manifest.buildCommand, workingDirectory: "." }]
+        : [];
+    if (commands.length === 0) {
       return this.persist(sandboxId, {
         success: true,
         command: [],
@@ -35,19 +47,40 @@ export class BuildRunner {
     }
 
     const startedAt = Date.now();
-    const result = await this.runner.run({
-      sandboxId,
-      workspaceDir,
-      command: manifest.buildCommand,
-      network,
-      environment
-    });
+    const logs: string[] = [];
+    const runs: NonNullable<BuildResult["commands"]> = [];
+    let exitCode: number | null = 0;
+    let success = true;
+    for (const build of commands) {
+      const result = await this.runner.run({
+        sandboxId,
+        workspaceDir,
+        workingDirectory: build.workingDirectory,
+        command: build.command,
+        network,
+        environment
+      });
+      logs.push(`[${build.id}]\n${result.log}`);
+      runs.push({
+        id: build.id,
+        command: build.command,
+        workingDirectory: build.workingDirectory,
+        success: result.success,
+        exitCode: result.exitCode
+      });
+      exitCode = result.exitCode;
+      if (!result.success) {
+        success = false;
+        break;
+      }
+    }
     const buildResult: BuildResult = {
-      success: result.success,
-      command: manifest.buildCommand,
-      exitCode: result.exitCode,
+      success,
+      command: commands[0].command,
+      commands: runs,
+      exitCode,
       durationMs: Date.now() - startedAt,
-      log: result.log
+      log: logs.join("\n")
     };
 
     return this.persist(sandboxId, buildResult);

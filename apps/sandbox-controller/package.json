@@ -12,18 +12,19 @@
   },
   "dependencies": {
     "@opspilot/database": "workspace:*",
-    "@opspilot/shared": "workspace:*",
     "@opspilot/schemas": "workspace:*",
+    "@opspilot/shared": "workspace:*",
     "express": "^4.19.2",
-    "unzipper": "^0.12.3"
+    "unzipper": "^0.12.3",
+    "yaml": "2.5.1"
   },
   "devDependencies": {
     "@types/archiver": "^6.0.2",
     "@types/express": "^4.17.21",
-    "typescript": "^5.4.5",
-    "tsx": "^4.11.0",
     "@types/node": "^20.12.12",
     "@types/unzipper": "^0.10.9",
-    "archiver": "^7.0.1"
+    "archiver": "^7.0.1",
+    "tsx": "^4.11.0",
+    "typescript": "^5.4.5"
   }
 }

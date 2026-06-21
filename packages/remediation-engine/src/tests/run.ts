@@ -50,22 +50,48 @@ async function runTests() {
 
   console.log("\n3. Testing Workflow Replay...");
   const steps = [
-    { type: "HTTP", config: { method: "POST", url: "/api/interviews", payload: {} } },
+    {
+      type: "HTTP",
+      config: {
+        method: "POST",
+        url: "/api/interviews",
+        payload: { owner: "${auth.userId}" },
+        extractVariables: {
+          "interview.id": ["$.data.id", "$.id"]
+        }
+      }
+    },
+    {
+      type: "HTTP",
+      config: {
+        method: "GET",
+        url: "/api/interviews/${interview.id}"
+      }
+    },
     { type: "BROWSER", config: { action: "navigate", url: "/room" } }
   ];
-  
+
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
+  const fetchedUrls: string[] = [];
+  const correlationIds: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    fetchedUrls.push(String(input));
+    correlationIds.push(new Headers(init?.headers).get("x-opspilot-correlation-id") || "");
     return {
       ok: true,
       status: 201,
-      text: async () => JSON.stringify({ success: true })
+      text: async () => JSON.stringify({ data: { id: "interview-123" } })
     } as Response;
   };
 
-  const replayRes = await wr.replay(steps);
+  const replayRes = await wr.replay(steps, {
+    initialVariables: { "auth.userId": "user-123" }
+  });
   assert.strictEqual(replayRes.success, true);
-  assert.strictEqual(replayRes.logs.length, 2);
+  assert.strictEqual(replayRes.logs.length, 3);
+  assert.strictEqual(replayRes.variables["interview.id"], "interview-123");
+  assert.strictEqual(fetchedUrls[1], "http://localhost:4000/api/interviews/interview-123");
+  assert.strictEqual(new Set(correlationIds).size, 1);
 
   globalThis.fetch = originalFetch;
   console.log("✓ Workflow replay completed.");

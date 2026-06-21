@@ -24,13 +24,33 @@ export interface RuntimeLifecycleResult {
   network: string;
   environmentNames: string[];
   endpoints: Array<{
+    serviceId: string;
+    serviceName: string;
+    kind: "frontend" | "api" | "worker" | "application";
     containerPort: number;
     hostPort: number;
     internalUrl: string;
     externalUrl: string;
   }>;
+  services: Array<{
+    serviceId: string;
+    serviceName: string;
+    kind: "frontend" | "api" | "worker" | "application";
+    success: boolean;
+    containerId?: string;
+    attempts: number;
+    log: string;
+  }>;
+  logs: Record<string, string>;
   stages: LifecycleStageResult[];
-  tests: Array<{ type: TestType; success: boolean; log: string; exitCode: number | null }>;
+  tests: Array<{
+    id: string;
+    serviceId?: string;
+    type: TestType;
+    success: boolean;
+    log: string;
+    exitCode: number | null;
+  }>;
 }
 
 export class RuntimeLifecycleError extends Error {
@@ -69,19 +89,10 @@ export class RuntimeLifecycleManager {
         manifest.execution.issues.join(" ") || "The repository does not have a supported execution manifest."
       );
     }
-    const application = manifest.execution.startCommands[0];
-    if (!application) {
+    const applications = manifest.execution.startCommands;
+    if (applications.length === 0) {
       throw new RuntimeLifecycleError("START_COMMAND_NOT_CONFIGURED", "No application start command was discovered.");
     }
-    if (!application.port) {
-      throw new RuntimeLifecycleError(
-        "APPLICATION_PORT_NOT_DISCOVERED",
-        "A verifiable application port is required for Runtime Lab."
-      );
-    }
-    const healthCheck = manifest.execution.healthChecks.find(
-      (candidate) => candidate.serviceId === application.id
-    );
 
     await this.cleanupRuntime(sandboxId);
     const network = await this.runner.createNetwork(sandboxId);
@@ -101,10 +112,11 @@ export class RuntimeLifecycleManager {
       }
 
       const environment = this.buildEnvironment(
-        manifest.execution.requiredEnvironment.map((item) => item.name),
+        manifest.execution.requiredEnvironment
+          .filter((item) => item.required)
+          .map((item) => item.name),
         dependencies.environment,
-        suppliedEnvironment,
-        application.port
+        suppliedEnvironment
       );
 
       await this.sandboxManager.updateStatus(sandboxId, "INSTALLING_DEPENDENCIES");
@@ -134,67 +146,97 @@ export class RuntimeLifecycleManager {
       }
       await this.sandboxManager.updateStatus(sandboxId, "BUILD_SUCCEEDED");
 
-      if (manifest.execution.migrationCommand) {
+      const migrationCommands = manifest.execution.migrationCommands?.length
+        ? manifest.execution.migrationCommands
+        : manifest.execution.migrationCommand
+          ? [{ id: "migrate:root", command: manifest.execution.migrationCommand, workingDirectory: "." }]
+          : [];
+      if (migrationCommands.length > 0) {
         await this.sandboxManager.updateStatus(sandboxId, "RUNNING_MIGRATIONS");
-        const migration = await this.runner.run({
-          sandboxId,
-          workspaceDir: manifest.repositoryRoot,
-          command: manifest.execution.migrationCommand,
-          network,
-          environment
-        });
-        stages.push({ stage: "migrations", ...migration });
-        if (!migration.success) {
-          return await this.fail(sandboxId, network, "MIGRATION_FAILED", stages);
+        for (const migrationCommand of migrationCommands) {
+          const migration = await this.runner.run({
+            sandboxId,
+            workspaceDir: manifest.repositoryRoot,
+            workingDirectory: migrationCommand.workingDirectory,
+            command: migrationCommand.command,
+            network,
+            environment
+          });
+          stages.push({ stage: migrationCommand.id, ...migration });
+          if (!migration.success) {
+            return await this.fail(sandboxId, network, "MIGRATION_FAILED", stages);
+          }
         }
       } else {
         stages.push({ stage: "migrations", success: true, log: "MIGRATION_COMMAND_NOT_CONFIGURED: Stage skipped." });
       }
 
       await this.sandboxManager.updateStatus(sandboxId, "STARTING_SERVICES");
-      const started = await this.serviceStartup.startService(
+      const started = await this.serviceStartup.startServices(
         sandboxId,
         manifest.repositoryRoot,
-        application,
+        applications,
         environment,
         network,
-        healthCheck?.path || "/"
+        manifest.execution.healthChecks
       );
-      stages.push({ stage: "start", success: started.success, log: started.log });
+      for (const service of started.services) {
+        stages.push({
+          stage: `start:${service.serviceId}`,
+          success: service.success,
+          log: service.log
+        });
+      }
       if (!started.success) {
         return await this.fail(sandboxId, network, "SERVICE_STARTUP_FAILED", stages);
       }
       await this.sandboxManager.updateStatus(sandboxId, "SERVICES_RUNNING");
 
-      const endpoint = started.endpoints.find(
-        (candidate) => candidate.containerPort === application.port
-      );
-      if (!endpoint) {
-        return await this.fail(sandboxId, network, "APPLICATION_ENDPOINT_NOT_AVAILABLE", stages);
-      }
-      const workflowProbe = await this.runHttpProbe(
-        endpoint.externalUrl,
-        healthCheck?.path || "/"
-      );
-      stages.push(workflowProbe);
-      if (!workflowProbe.success) {
-        return await this.fail(sandboxId, network, "WORKFLOW_REPLAY_FAILED", stages);
+      for (const healthCheck of manifest.execution.healthChecks) {
+        if (healthCheck.type !== "http") continue;
+        const endpoint = started.endpoints.find(
+          (candidate) =>
+            candidate.serviceId === healthCheck.serviceId &&
+            candidate.containerPort === healthCheck.port
+        );
+        if (!endpoint) {
+          stages.push({
+            stage: `workflow:http-health:${healthCheck.serviceId}`,
+            success: false,
+            log: `APPLICATION_ENDPOINT_NOT_AVAILABLE: ${healthCheck.serviceId}`
+          });
+          return await this.fail(sandboxId, network, "APPLICATION_ENDPOINT_NOT_AVAILABLE", stages);
+        }
+        const workflowProbe = await this.runHttpProbe(
+          endpoint.externalUrl,
+          healthCheck.path || "/",
+          healthCheck.serviceId
+        );
+        stages.push(workflowProbe);
+        if (!workflowProbe.success) {
+          return await this.fail(sandboxId, network, "WORKFLOW_REPLAY_FAILED", stages);
+        }
       }
 
       const tests: RuntimeLifecycleResult["tests"] = [];
       for (const command of manifest.execution.testCommands) {
         await this.sandboxManager.updateStatus(sandboxId, `RUNNING_${command.type.toUpperCase()}_TESTS`);
-        const test = await this.testRunner.runTests(
+        const target = this.serviceStartup.getActiveServices(sandboxId)
+          .find((candidate) => candidate.service.id === command.serviceId) ||
+          this.serviceStartup.getActiveServices(sandboxId)
+            .find((candidate) => candidate.service.kind === "api") ||
+          this.serviceStartup.getActiveServices(sandboxId)[0];
+        const canExecInService = target && !target.service.build;
+        const test = await this.testRunner.runTestCommand(
           sandboxId,
           manifest.repositoryRoot,
-          command.type,
-          manifest.execution,
+          command,
           network,
-          environment,
-          started.containerId
+          started.environment,
+          canExecInService ? target.containerId : undefined
         );
-        tests.push({ type: command.type, ...test });
-        stages.push({ stage: `test:${command.type}`, ...test });
+        tests.push({ id: command.id, serviceId: command.serviceId, type: command.type, ...test });
+        stages.push({ stage: command.id, ...test });
       }
 
       if (tests.length === 0) {
@@ -211,13 +253,24 @@ export class RuntimeLifecycleManager {
           ? "RUNTIME_RUNNING_UNVERIFIED"
           : "TESTS_FAILED";
       await this.sandboxManager.updateStatus(sandboxId, status);
+      const logs = await this.serviceStartup.collectLogs(sandboxId);
       return {
         success,
         sandboxId,
         status,
         network,
-        environmentNames: Object.keys(environment).sort(),
+        environmentNames: Object.keys(started.environment).sort(),
         endpoints: started.endpoints,
+        services: started.services.map((service) => ({
+          serviceId: service.serviceId,
+          serviceName: service.serviceName,
+          kind: service.kind,
+          success: service.success,
+          containerId: service.containerId,
+          attempts: service.attempts,
+          log: service.log
+        })),
+        logs,
         stages,
         tests
       };
@@ -249,14 +302,26 @@ export class RuntimeLifecycleManager {
   private buildEnvironment(
     requiredNames: string[],
     generated: Record<string, string>,
-    supplied: Record<string, string>,
-    port?: number
+    supplied: Record<string, string>
   ): Record<string, string> {
+    const serviceGeneratedNames = new Set([
+      "PORT",
+      "HOST",
+      "HOSTNAME",
+      "BASE_URL",
+      "APP_URL",
+      "API_URL",
+      "BACKEND_URL",
+      "NEXT_PUBLIC_API_URL",
+      "FRONTEND_URL"
+    ]);
+    requiredNames = [...new Set(requiredNames)].filter(
+      (name) => !serviceGeneratedNames.has(name) && !name.startsWith("OPSPILOT_SERVICE_")
+    );
     const allowedNames = new Set(requiredNames);
     const protectedNames = new Set([
       ...Object.keys(generated),
       "NODE_ENV",
-      "PORT",
       "HOST",
       "HOSTNAME",
       "BASE_URL",
@@ -274,12 +339,6 @@ export class RuntimeLifecycleManager {
       HOST: "0.0.0.0",
       HOSTNAME: "0.0.0.0"
     };
-    if (port) environment.PORT = String(port);
-    if (port) {
-      environment.BASE_URL ||= `http://127.0.0.1:${port}`;
-      environment.APP_URL ||= `http://127.0.0.1:${port}`;
-    }
-
     for (const name of requiredNames) {
       if (!environment[name] && /(?:SECRET|SIGNING_KEY)$/i.test(name)) {
         environment[name] = crypto.randomBytes(32).toString("base64url");
@@ -296,7 +355,11 @@ export class RuntimeLifecycleManager {
     return environment;
   }
 
-  private async runHttpProbe(baseUrl: string, requestPath: string): Promise<LifecycleStageResult> {
+  private async runHttpProbe(
+    baseUrl: string,
+    requestPath: string,
+    serviceId: string
+  ): Promise<LifecycleStageResult> {
     const url = new URL(requestPath, `${baseUrl}/`).toString();
     const startedAt = Date.now();
     try {
@@ -308,14 +371,14 @@ export class RuntimeLifecycleManager {
           }));
       const body = response.body.slice(0, 2_048);
       return {
-        stage: "workflow:http-health",
+        stage: `workflow:http-health:${serviceId}`,
         success: response.status < 500,
         durationMs: Date.now() - startedAt,
         log: `GET ${url} -> ${response.status}${body ? `\n${body}` : ""}`
       };
     } catch (error) {
       return {
-        stage: "workflow:http-health",
+        stage: `workflow:http-health:${serviceId}`,
         success: false,
         durationMs: Date.now() - startedAt,
         log: `GET ${url} failed: ${error instanceof Error ? error.message : String(error)}`
@@ -330,6 +393,16 @@ export class RuntimeLifecycleManager {
     stages: LifecycleStageResult[]
   ): Promise<RuntimeLifecycleResult> {
     await this.sandboxManager.updateStatus(sandboxId, status);
+    const logs = await this.serviceStartup.collectLogs(sandboxId);
+    const services = this.serviceStartup.getActiveServices(sandboxId).map((active) => ({
+      serviceId: active.service.id,
+      serviceName: active.service.name,
+      kind: active.service.kind,
+      success: true,
+      containerId: active.containerId,
+      attempts: 1,
+      log: logs[active.service.id] || ""
+    }));
     await this.cleanupRuntime(sandboxId);
     return {
       success: false,
@@ -338,6 +411,8 @@ export class RuntimeLifecycleManager {
       network,
       environmentNames: [],
       endpoints: [],
+      services,
+      logs,
       stages,
       tests: []
     };

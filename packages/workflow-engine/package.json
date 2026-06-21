@@ -6,15 +6,23 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
+    "test": "node dist/tests/run.js",
     "clean": "tsc --build --clean"
   },
   "dependencies": {
-    "@opspilot/shared": "workspace:*",
+    "@opspilot/database": "workspace:*",
     "@opspilot/schemas": "workspace:*",
-    "@opspilot/database": "workspace:*"
+    "@opspilot/shared": "workspace:*",
+    "ioredis": "^5.11.1",
+    "mongodb": "^7.3.0",
+    "pg": "^8.22.0",
+    "playwright": "^1.61.0",
+    "socket.io-client": "^4.8.3",
+    "typescript": "^5.4.5",
+    "yaml": "2.5.1"
   },
   "devDependencies": {
-    "typescript": "^5.4.5",
-    "@types/node": "^20.12.12"
+    "@types/node": "^20.12.12",
+    "@types/pg": "^8.20.0"
   }
 }

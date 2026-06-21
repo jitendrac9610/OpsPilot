@@ -1,16 +1,21 @@
 import fs from "node:fs";
-import path from "node:path";
+import { EndpointContract, HTTPWorkflowConfig } from "@opspilot/schemas";
 import { prisma } from "@opspilot/database";
 import { logger } from "@opspilot/shared";
+import { mergeEndpointContracts, successfulStatus } from "./contractUtils.js";
+import { discoverOpenApiContracts } from "./openApiDiscovery.js";
+import { discoverTypeScriptContracts } from "./typescriptContractDiscovery.js";
+import { StatefulWorkflowPlanner } from "./statefulPlanner.js";
 
 export interface DiscoveredWorkflow {
   name: string;
   description: string;
   source: string;
+  contract: EndpointContract;
   steps: Array<{
     name: string;
     type: "HTTP";
-    config: { method: string; url: string; expectedStatus?: number };
+    config: HTTPWorkflowConfig;
   }>;
 }
 
@@ -18,23 +23,13 @@ export class WorkflowDiscoverer {
   constructor(private readonly dbFallback = false) {}
 
   public async discover(projectId: string, repoDirectory: string): Promise<DiscoveredWorkflow[]> {
-    logger.info({ projectId, repoDirectory }, "Discovering workflows from repository evidence");
-    if (!fs.existsSync(repoDirectory)) {
-      logger.warn({ repoDirectory }, "Workflow discovery repository directory does not exist");
-      return [];
-    }
+    logger.info({ projectId, repoDirectory }, "Discovering endpoint contracts from repository evidence");
+    const contracts = await this.discoverContracts(repoDirectory);
+    const workflows = contracts.map((contract) => this.httpWorkflow(contract));
 
-    const workflows = [
-      ...(await this.discoverOpenApi(repoDirectory)),
-      ...(await this.discoverExpressRoutes(repoDirectory)),
-      ...(await this.discoverNextRoutes(repoDirectory))
-    ];
-    const deduplicated = [...new Map(
-      workflows.map((workflow) => [`${workflow.steps[0]?.config.method}:${workflow.steps[0]?.config.url}`, workflow])
-    ).values()];
-
+    // Save individual endpoint workflows for retro-compatibility and unit tests
     if (!this.dbFallback) {
-      for (const workflow of deduplicated) {
+      for (const workflow of workflows) {
         try {
           const existing = await prisma.syntheticWorkflow.findFirst({
             where: { projectId, name: workflow.name }
@@ -53,120 +48,70 @@ export class WorkflowDiscoverer {
           logger.warn({ error, workflow: workflow.name }, "Failed to persist discovered workflow");
         }
       }
-    }
-    return deduplicated;
-  }
 
-  private async discoverOpenApi(root: string): Promise<DiscoveredWorkflow[]> {
-    const candidates = ["openapi.json", "swagger.json", "docs/openapi.json", "api/openapi.json"];
-    const workflows: DiscoveredWorkflow[] = [];
-
-    for (const candidate of candidates) {
-      const filePath = path.join(root, candidate);
-      if (!fs.existsSync(filePath)) continue;
+      // Generate and persist the comprehensive stateful workflow
       try {
-        const document = JSON.parse(await fs.promises.readFile(filePath, "utf8")) as {
-          paths?: Record<string, Record<string, { summary?: string; responses?: Record<string, unknown> }>>;
-        };
-        for (const [route, operations] of Object.entries(document.paths || {})) {
-          for (const [method, operation] of Object.entries(operations)) {
-            if (!["get", "post", "put", "patch", "delete"].includes(method)) continue;
-            const expectedStatus = Object.keys(operation.responses || {})
-              .map(Number)
-              .find((status) => status >= 200 && status < 400);
-            workflows.push(this.httpWorkflow(
-              operation.summary || `${method.toUpperCase()} ${route}`,
-              method,
-              route,
-              candidate,
-              expectedStatus
-            ));
-          }
+        const statefulPlanner = new StatefulWorkflowPlanner();
+        const statefulPlan = await statefulPlanner.planWorkflow(projectId, contracts);
+        const name = `Stateful Lifecycle Integration Workflow`;
+        const existing = await prisma.syntheticWorkflow.findFirst({
+          where: { projectId, name }
+        });
+        if (!existing) {
+          await prisma.syntheticWorkflow.create({
+            data: {
+              projectId,
+              name,
+              description: statefulPlan.description,
+              steps: statefulPlan.steps as any
+            }
+          });
+          logger.info({ projectId, name }, "Persisted stateful workflow successfully");
         }
       } catch (error) {
-        logger.warn({ error, filePath }, "Could not parse OpenAPI JSON document");
+        logger.warn({ error }, "Failed to generate or persist stateful lifecycle workflow");
       }
     }
     return workflows;
   }
 
-  private async discoverExpressRoutes(root: string): Promise<DiscoveredWorkflow[]> {
-    const workflows: DiscoveredWorkflow[] = [];
-    const files = await listFiles(root);
-    const routePattern = /\b(?:app|router)\.(get|post|put|patch|delete)\s*\(\s*["'`]([^"'`]+)["'`]/g;
-
-    for (const filePath of files) {
-      const content = await fs.promises.readFile(filePath, "utf8").catch(() => "");
-      for (const match of content.matchAll(routePattern)) {
-        const source = path.relative(root, filePath).replace(/\\/g, "/");
-        workflows.push(this.httpWorkflow(
-          `${match[1].toUpperCase()} ${match[2]}`,
-          match[1],
-          match[2],
-          source
-        ));
-      }
+  public async discoverContracts(repoDirectory: string): Promise<EndpointContract[]> {
+    if (!fs.existsSync(repoDirectory)) {
+      logger.warn({ repoDirectory }, "Workflow discovery repository directory does not exist");
+      return [];
     }
-    return workflows;
+    const [openApi, sourceCode] = await Promise.all([
+      discoverOpenApiContracts(repoDirectory),
+      discoverTypeScriptContracts(repoDirectory)
+    ]);
+    const contracts = mergeEndpointContracts([...openApi, ...sourceCode]);
+    logger.info({
+      repoDirectory,
+      openApiContracts: openApi.length,
+      sourceContracts: sourceCode.length,
+      mergedContracts: contracts.length
+    }, "Endpoint contract discovery completed");
+    return contracts;
   }
 
-  private async discoverNextRoutes(root: string): Promise<DiscoveredWorkflow[]> {
-    const workflows: DiscoveredWorkflow[] = [];
-    const files = await listFiles(root);
-    for (const filePath of files) {
-      const relative = path.relative(root, filePath).replace(/\\/g, "/");
-      const appRoute = relative.match(/(?:^|\/)app\/api\/(.+)\/route\.(?:ts|js|tsx|jsx)$/);
-      const pagesRoute = relative.match(/(?:^|\/)pages\/api\/(.+)\.(?:ts|js|tsx|jsx)$/);
-      if (!appRoute && !pagesRoute) continue;
-
-      const route = `/api/${(appRoute?.[1] || pagesRoute?.[1] || "")
-        .replace(/\/index$/, "")
-        .replace(/\[([^\]]+)\]/g, ":$1")}`;
-      const content = await fs.promises.readFile(filePath, "utf8").catch(() => "");
-      const methods = appRoute
-        ? [...content.matchAll(/export\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\b/g)].map((match) => match[1])
-        : ["GET"];
-      for (const method of new Set(methods)) {
-        workflows.push(this.httpWorkflow(`${method} ${route}`, method, route, relative));
-      }
-    }
-    return workflows;
-  }
-
-  private httpWorkflow(
-    name: string,
-    method: string,
-    url: string,
-    source: string,
-    expectedStatus?: number
-  ): DiscoveredWorkflow {
+  private httpWorkflow(contract: EndpointContract): DiscoveredWorkflow {
+    const name = contract.summary || `${contract.method} ${contract.path}`;
+    const expectedStatus = successfulStatus(contract.responses, contract.method);
     return {
       name,
-      description: `Repository-derived HTTP workflow from ${source}.`,
-      source,
+      description: `Repository-derived ${contract.framework} endpoint contract from ${contract.source.file}.`,
+      source: contract.source.file,
+      contract,
       steps: [{
         name,
         type: "HTTP",
-        config: { method: method.toUpperCase(), url, expectedStatus }
+        config: {
+          method: contract.method,
+          url: contract.path,
+          expectedStatus,
+          contract
+        }
       }]
     };
   }
-}
-
-async function listFiles(root: string): Promise<string[]> {
-  const files: string[] = [];
-  const pending = [root];
-  const excluded = new Set([".git", "node_modules", ".next", "dist", "build", "coverage"]);
-  const extensions = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]);
-
-  while (pending.length > 0 && files.length < 5000) {
-    const current = pending.pop()!;
-    const entries = await fs.promises.readdir(current, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      const absolute = path.join(current, entry.name);
-      if (entry.isDirectory() && !excluded.has(entry.name)) pending.push(absolute);
-      if (entry.isFile() && extensions.has(path.extname(entry.name))) files.push(absolute);
-    }
-  }
-  return files;
 }

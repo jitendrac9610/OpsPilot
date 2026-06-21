@@ -1,7 +1,7 @@
 import { prisma } from "@opspilot/database";
 import { logger } from "@opspilot/shared";
 import { ContainerRunner } from "./containerRunner.js";
-import { ExecutionManifest } from "./executionManifest.js";
+import { ExecutionManifest, TestCommand } from "./executionManifest.js";
 
 export class TestRunner {
   constructor(
@@ -27,19 +27,41 @@ export class TestRunner {
       });
     }
 
-    logger.info({ sandboxId, workspaceDir, type, command: test.command }, "Running discovered test command");
+    return this.runTestCommand(
+      sandboxId,
+      workspaceDir,
+      test,
+      network,
+      environment,
+      applicationContainerId
+    );
+  }
+
+  public async runTestCommand(
+    sandboxId: string,
+    workspaceDir: string,
+    test: TestCommand,
+    network?: string,
+    environment: Record<string, string> = {},
+    applicationContainerId?: string
+  ): Promise<{ success: boolean; log: string; exitCode: number | null }> {
+    logger.info(
+      { sandboxId, workspaceDir, type: test.type, command: test.command, workingDirectory: test.workingDirectory },
+      "Running discovered test command"
+    );
     const result = applicationContainerId
-      ? await this.runner.exec(applicationContainerId, test.command)
+      ? await this.runner.exec(applicationContainerId, test.command, 10_000, test.workingDirectory)
       : await this.runner.run({
           sandboxId,
           workspaceDir,
+          workingDirectory: test.workingDirectory,
           command: test.command,
           network,
           allowNetwork: false,
           environment
         });
 
-    return this.persist(sandboxId, type, {
+    return this.persist(sandboxId, test.type, {
       success: result.success,
       exitCode: result.exitCode,
       log: result.log

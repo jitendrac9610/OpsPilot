@@ -169,6 +169,37 @@ app.post("/api/sandboxes/:id/test", async (req, res) => {
   }
 });
 
+app.get("/api/sandboxes/:id/logs", async (req, res) => {
+  try {
+    const sandboxId = req.params.id;
+    const logs = await serviceStartupManager.collectLogs(sandboxId);
+    return res.json({ success: true, logs });
+  } catch (error) {
+    logger.error({ error }, "Failed to get logs");
+    return res.status(500).json({ error: "LOG_EXTRACTION_FAILED", message: "Failed to get logs." });
+  }
+});
+
+app.get("/api/sandboxes/:id/services", async (req, res) => {
+  try {
+    const sandboxId = req.params.id;
+    const services = serviceStartupManager.getActiveServices(sandboxId);
+    return res.json({
+      success: true,
+      services: services.map((active) => ({
+        id: active.service.id,
+        name: active.service.name,
+        kind: active.service.kind,
+        port: active.service.port,
+        endpoints: active.endpoints
+      }))
+    });
+  } catch (error) {
+    logger.error({ error }, "Failed to get services");
+    return res.status(500).json({ error: "SERVICE_LIST_FAILED", message: "Failed to get services." });
+  }
+});
+
 app.delete("/api/sandboxes/:id", async (req, res) => {
   try {
     const sandboxId = req.params.id;

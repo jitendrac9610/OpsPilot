@@ -9,6 +9,7 @@
     "clean": "tsc --build --clean"
   },
   "dependencies": {
+    "@opspilot/database": "workspace:*",
     "@opspilot/shared": "workspace:*",
     "@opspilot/schemas": "workspace:*"
   },

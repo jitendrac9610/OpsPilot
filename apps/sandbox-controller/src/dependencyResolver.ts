@@ -17,7 +17,12 @@ export class DependencyResolver {
   ): Promise<{ success: boolean; log: string; exitCode: number | null }> {
     logger.info({ workspaceDir, sandboxId }, "Installing locked dependencies in isolated container");
 
-    if (manifest.installCommand.length === 0) {
+    const commands = manifest.installCommands?.length
+      ? manifest.installCommands
+      : manifest.installCommand.length > 0
+        ? [{ id: "install:root", command: manifest.installCommand, workingDirectory: "." }]
+        : [];
+    if (commands.length === 0) {
       return this.persist(sandboxId, {
         success: false,
         exitCode: null,
@@ -25,17 +30,29 @@ export class DependencyResolver {
       });
     }
 
-    const result = await this.runner.run({
-      sandboxId,
-      workspaceDir,
-      command: manifest.installCommand,
-      allowNetwork: !network,
-      network
-    });
+    const logs: string[] = [];
+    let exitCode: number | null = 0;
+    let success = true;
+    for (const install of commands) {
+      const result = await this.runner.run({
+        sandboxId,
+        workspaceDir,
+        workingDirectory: install.workingDirectory,
+        command: install.command,
+        allowNetwork: !network,
+        network
+      });
+      logs.push(`[${install.id}]\n${result.log}`);
+      exitCode = result.exitCode;
+      if (!result.success) {
+        success = false;
+        break;
+      }
+    }
     return this.persist(sandboxId, {
-      success: result.success,
-      exitCode: result.exitCode,
-      log: result.log
+      success,
+      exitCode,
+      log: logs.join("\n")
     });
   }
 

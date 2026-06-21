@@ -4,7 +4,11 @@ import path from "node:path";
 import unzipper from "unzipper";
 import { prisma } from "@opspilot/database";
 import { config, logger, storage } from "@opspilot/shared";
-import { discoverExecutionManifest, ExecutionManifest } from "./executionManifest.js";
+import {
+  discoverExecutionManifest,
+  ExecutionManifest,
+  normalizeExecutionManifest
+} from "./executionManifest.js";
 
 interface SnapshotRecord {
   id: string;
@@ -88,7 +92,9 @@ export class SandboxManager {
     if (!fs.existsSync(manifestPath)) {
       throw new Error(`Workspace manifest not found for sandbox ${sandboxId}`);
     }
-    return JSON.parse(fs.readFileSync(manifestPath, "utf8")) as WorkspaceManifest;
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as WorkspaceManifest;
+    manifest.execution = normalizeExecutionManifest(manifest.execution);
+    return manifest;
   }
 
   public async createSandbox(snapshotId: string): Promise<string> {

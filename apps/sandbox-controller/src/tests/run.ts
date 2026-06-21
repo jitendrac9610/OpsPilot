@@ -17,6 +17,9 @@ import { DependencyServiceManager } from "../dependencyServices.js";
 import { RuntimeLifecycleManager } from "../runtimeLifecycle.js";
 
 class FakeContainerRunner extends ContainerRunner {
+  public readonly starts: Array<ContainerRunOptions & { ports?: number[] }> = [];
+  private nextContainer = 0;
+
   public override async run(_options: ContainerRunOptions): Promise<ContainerRunResult> {
     return { success: true, exitCode: 0, log: "real command result fixture", timedOut: false };
   }
@@ -24,18 +27,38 @@ class FakeContainerRunner extends ContainerRunner {
   public override async startDetached(
     _options: ContainerRunOptions & { ports?: number[] }
   ): Promise<ContainerRunResult & { containerId?: string; portBindings: any[] }> {
+    this.starts.push(_options);
+    this.nextContainer++;
+    const containerId = `${_options.name || "service"}-container-${this.nextContainer}`;
     return {
       success: true,
       exitCode: 0,
-      log: "container-fixture",
+      log: containerId,
       timedOut: false,
-      containerId: "container-fixture",
+      containerId,
       portBindings: (_options.ports || []).map((port) => ({
         containerPort: port,
-        hostPort: 49_173,
-        internalUrl: `http://application:${port}`,
-        externalUrl: "http://127.0.0.1:49173"
+        hostPort: 49_172 + this.nextContainer,
+        internalUrl: `http://${_options.networkAliases?.[0] || "application"}:${port}`,
+        externalUrl: `http://127.0.0.1:${49_172 + this.nextContainer}`
       }))
+    };
+  }
+
+  public override async buildImage(options: {
+    sandboxId: string;
+    workspaceDir: string;
+    context: string;
+    dockerfile?: string;
+    name: string;
+    network?: string;
+  }): Promise<ContainerRunResult & { image: string }> {
+    return {
+      success: true,
+      exitCode: 0,
+      log: `built ${options.name}`,
+      timedOut: false,
+      image: `opspilot/test/${options.name}:latest`
     };
   }
 
@@ -45,6 +68,31 @@ class FakeContainerRunner extends ContainerRunner {
   public override async cleanupSandboxResources(_sandboxId: string): Promise<void> {}
   public override async exec(_containerId: string, _command: string[]): Promise<ContainerRunResult> {
     return { success: true, exitCode: 0, log: "ready", timedOut: false };
+  }
+  public override async logs(containerId: string): Promise<ContainerRunResult> {
+    return { success: true, exitCode: 0, log: `logs:${containerId}`, timedOut: false };
+  }
+  public override async isRunning(_containerId: string): Promise<boolean> { return true; }
+}
+
+class FlakyContainerRunner extends FakeContainerRunner {
+  private failedOnce = false;
+
+  public override async startDetached(
+    options: ContainerRunOptions & { ports?: number[] }
+  ): Promise<ContainerRunResult & { containerId?: string; portBindings: any[] }> {
+    if (!this.failedOnce) {
+      this.failedOnce = true;
+      this.starts.push(options);
+      return {
+        success: false,
+        exitCode: 1,
+        log: "intentional first-start failure",
+        timedOut: false,
+        portBindings: []
+      };
+    }
+    return super.startDetached(options);
   }
 }
 
@@ -67,6 +115,93 @@ async function runTests() {
   assert.strictEqual(manifest.services[0].type, "postgresql");
   assert.deepStrictEqual(manifest.migrationCommand, ["npm", "exec", "--", "prisma", "migrate", "deploy"]);
   assert.strictEqual(manifest.supported, true);
+
+  const multiRoot = path.join(tempRoot, "multi-service");
+  await fs.promises.mkdir(path.join(multiRoot, "apps", "api", "src"), { recursive: true });
+  await fs.promises.mkdir(path.join(multiRoot, "apps", "worker", "src"), { recursive: true });
+  await fs.promises.mkdir(path.join(multiRoot, "apps", "web", "src"), { recursive: true });
+  await fs.promises.writeFile(path.join(multiRoot, "package.json"), JSON.stringify({
+    name: "example-monorepo",
+    private: true,
+    packageManager: "pnpm@9.1.4",
+    workspaces: ["apps/*"],
+    scripts: { build: "turbo build" }
+  }));
+  await fs.promises.writeFile(path.join(multiRoot, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  await fs.promises.writeFile(path.join(multiRoot, "pnpm-workspace.yaml"), "packages:\n  - apps/*\n");
+  await fs.promises.writeFile(path.join(multiRoot, "apps", "api", "package.json"), JSON.stringify({
+    name: "@example/api",
+    scripts: { start: "node src/index.js", test: "node --test" },
+    dependencies: { express: "1.0.0", pg: "1.0.0" }
+  }));
+  await fs.promises.writeFile(
+    path.join(multiRoot, "apps", "api", "src", "index.js"),
+    "require('express')().listen(process.env.PORT || 4100)"
+  );
+  await fs.promises.writeFile(path.join(multiRoot, "apps", "worker", "package.json"), JSON.stringify({
+    name: "@example/worker",
+    scripts: { start: "node src/index.js" },
+    dependencies: { bullmq: "1.0.0" }
+  }));
+  await fs.promises.writeFile(
+    path.join(multiRoot, "apps", "worker", "src", "index.js"),
+    "const { Worker } = require('bullmq'); new Worker('orders', async () => {})"
+  );
+  await fs.promises.writeFile(path.join(multiRoot, "apps", "web", "package.json"), JSON.stringify({
+    name: "@example/web",
+    scripts: { start: "next start" },
+    dependencies: { next: "1.0.0", react: "1.0.0" }
+  }));
+  await fs.promises.writeFile(
+    path.join(multiRoot, "apps", "web", "src", "index.tsx"),
+    "import React from 'react'; export default function Page(){ return <main /> }"
+  );
+  await fs.promises.writeFile(path.join(multiRoot, "docker-compose.yml"), `
+services:
+  postgres:
+    image: postgres:16
+  redis:
+    image: redis:7
+  api:
+    build:
+      context: ./apps/api
+    ports:
+      - "4100:4100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+  worker:
+    build: ./apps/worker
+    depends_on:
+      - api
+      - redis
+  web:
+    build: ./apps/web
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+      - worker
+`);
+  const multiManifest = await discoverExecutionManifest(multiRoot);
+  assert.strictEqual(multiManifest.version, 2);
+  assert.strictEqual(multiManifest.repositoryKind, "hybrid");
+  assert.deepStrictEqual(
+    multiManifest.startCommands.map((service) => service.kind),
+    ["api", "worker", "frontend"]
+  );
+  assert.deepStrictEqual(
+    multiManifest.services.map((service) => service.type).sort(),
+    ["postgresql", "redis"]
+  );
+  assert.ok(multiManifest.startCommands[1].dependsOn.includes(multiManifest.startCommands[0].id));
+  assert.ok(multiManifest.startCommands[2].dependsOn.includes(multiManifest.startCommands[1].id));
+  assert.strictEqual(
+    multiManifest.healthChecks.find((check) => check.serviceId === multiManifest.startCommands[1].id)?.type,
+    "process"
+  );
 
   const failingManager = new SandboxManager({
     baseDir: tempRoot,
@@ -126,8 +261,47 @@ async function runTests() {
     { id: "app", name: "app", command: ["npm", "start"], port: 3000 }
   );
   assert.strictEqual(serviceResult.success, true);
-  assert.deepStrictEqual(serviceManager.getActiveContainers("sb-test"), ["container-fixture"]);
+  assert.strictEqual(serviceManager.getActiveContainers("sb-test").length, 1);
   await serviceManager.stopAll("sb-test");
+
+  const multiRunner = new FakeContainerRunner();
+  const multiServiceManager = new ServiceStartupManager(true, multiRunner, async () => true);
+  const multiStart = await multiServiceManager.startServices(
+    "sb-multi",
+    multiRoot,
+    multiManifest.startCommands,
+    { NODE_ENV: "test" },
+    "opspilot-test",
+    multiManifest.healthChecks
+  );
+  assert.strictEqual(multiStart.success, true);
+  assert.strictEqual(multiStart.services.length, 3);
+  assert.strictEqual(multiStart.endpoints.length, 2);
+  assert.notStrictEqual(multiStart.endpoints[0].hostPort, multiStart.endpoints[1].hostPort);
+  assert.ok(multiStart.environment.API_URL?.includes(multiManifest.startCommands[0].id));
+  assert.strictEqual(multiRunner.starts[2].environment?.NEXT_PUBLIC_API_URL, multiStart.environment.API_URL);
+  assert.deepStrictEqual(Object.keys(await multiServiceManager.collectLogs("sb-multi")).sort(), [
+    multiManifest.startCommands[0].id,
+    multiManifest.startCommands[1].id,
+    multiManifest.startCommands[2].id
+  ].sort());
+  await multiServiceManager.stopAll("sb-multi");
+
+  const flakyRunner = new FlakyContainerRunner();
+  const retryManager = new ServiceStartupManager(true, flakyRunner, async () => true);
+  const retryService = { ...multiManifest.startCommands[0], build: undefined, restartAttempts: 1 };
+  const retryResult = await retryManager.startServices(
+    "sb-retry",
+    multiRoot,
+    [retryService],
+    {},
+    "opspilot-test",
+    multiManifest.healthChecks.filter((check) => check.serviceId === retryService.id)
+  );
+  assert.strictEqual(retryResult.success, true);
+  assert.strictEqual(retryResult.services[0].attempts, 2);
+  assert.strictEqual(flakyRunner.starts.length, 2);
+  await retryManager.stopAll("sb-retry");
 
   const lifecycleServiceManager = new ServiceStartupManager(true, runner, async () => true);
   const lifecycle = new RuntimeLifecycleManager(
@@ -143,8 +317,9 @@ async function runTests() {
   const lifecycleResult = await lifecycle.run(hydratedSandboxId);
   assert.strictEqual(lifecycleResult.success, true);
   assert.strictEqual(lifecycleResult.status, "RUNTIME_VERIFIED");
-  assert.strictEqual(lifecycleResult.endpoints[0].hostPort, 49_173);
-  assert.ok(lifecycleResult.stages.some((stage) => stage.stage === "workflow:http-health"));
+  assert.ok(lifecycleResult.endpoints[0].hostPort >= 49_173);
+  assert.ok(lifecycleResult.stages.some((stage) => stage.stage.startsWith("workflow:http-health:")));
+  assert.ok(lifecycleResult.logs.application);
   await lifecycle.cleanupRuntime(hydratedSandboxId);
 
   await new CleanupManager().deleteWorkspaceDir(tempRoot);

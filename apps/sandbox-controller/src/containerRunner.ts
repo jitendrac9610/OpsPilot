@@ -6,7 +6,9 @@ import { config, logger } from "@opspilot/shared";
 export interface ContainerRunOptions {
   sandboxId: string;
   workspaceDir?: string;
+  workingDirectory?: string;
   command: string[];
+  name?: string;
   allowNetwork?: boolean;
   network?: string;
   networkAliases?: string[];
@@ -46,7 +48,7 @@ export class ContainerRunner {
       "--memory", config.sandbox.memoryLimit,
       "--cpus", config.sandbox.cpuLimit,
       ...this.userArgs(options.user),
-      ...this.workspaceArgs(options.workspaceDir),
+      ...this.workspaceArgs(options.workspaceDir, options.workingDirectory),
       "--network", options.network || (options.allowNetwork ? "bridge" : "none"),
       ...this.environmentArgs(options.environment),
       options.image || config.sandbox.image,
@@ -61,8 +63,8 @@ export class ContainerRunner {
   public async startDetached(
     options: ContainerRunOptions & { ports?: number[] }
   ): Promise<ContainerRunResult & { containerId?: string; portBindings: PortBinding[] }> {
-    this.validateCommand(options.command);
-    const containerName = this.containerName(options.sandboxId, options.command[0]);
+    this.validateCommand(options.command, Boolean(options.image));
+    const containerName = this.containerName(options.sandboxId, options.name || options.command[0] || "service");
     const portArgs = (options.ports || []).flatMap((port) => ["--publish", `127.0.0.1::${port}`]);
     const args = [
       "run",
@@ -77,7 +79,7 @@ export class ContainerRunner {
       "--memory", config.sandbox.memoryLimit,
       "--cpus", config.sandbox.cpuLimit,
       ...this.userArgs(options.user),
-      ...this.workspaceArgs(options.workspaceDir),
+      ...this.workspaceArgs(options.workspaceDir, options.workingDirectory),
       "--network", options.network || (options.allowNetwork ? "bridge" : "none"),
       ...(options.networkAliases || []).flatMap((alias) => ["--network-alias", alias]),
       ...portArgs,
@@ -113,6 +115,28 @@ export class ContainerRunner {
     };
   }
 
+  public async buildImage(options: {
+    sandboxId: string;
+    workspaceDir: string;
+    context: string;
+    dockerfile?: string;
+    name: string;
+    network?: string;
+  }): Promise<ContainerRunResult & { image: string }> {
+    const context = this.resolveWorkspacePath(options.workspaceDir, options.context);
+    const image = this.imageName(options.sandboxId, options.name);
+    const args = [
+      "build",
+      "--label", `opspilot.sandbox=${options.sandboxId}`,
+      "--tag", image,
+      ...(options.network ? ["--network", options.network] : []),
+      ...(options.dockerfile ? ["--file", path.resolve(context, options.dockerfile)] : []),
+      context
+    ];
+    const result = await this.executeDocker(args);
+    return { ...result, image };
+  }
+
   public async createNetwork(sandboxId: string): Promise<string> {
     const networkName = this.networkName(sandboxId);
     const result = await this.executeDocker(
@@ -136,24 +160,48 @@ export class ContainerRunner {
     );
     const containerIds = listed.success ? listed.log.trim().split(/\s+/).filter(Boolean) : [];
     await Promise.all(containerIds.map((containerId) => this.stop(containerId).catch(() => undefined)));
+    const images = await this.executeDocker(
+      ["image", "ls", "--quiet", "--filter", `label=opspilot.sandbox=${sandboxId}`],
+      15_000
+    );
+    const imageIds = images.success ? [...new Set(images.log.trim().split(/\s+/).filter(Boolean))] : [];
+    await Promise.all(imageIds.map((imageId) =>
+      this.executeDocker(["image", "rm", "--force", imageId], 30_000).catch(() => undefined)
+    ));
     await this.removeNetwork(this.networkName(sandboxId)).catch(() => undefined);
   }
 
-  public async exec(containerId: string, command: string[], timeoutMs = 10_000): Promise<ContainerRunResult> {
+  public async exec(
+    containerId: string,
+    command: string[],
+    timeoutMs = 10_000,
+    workingDirectory?: string
+  ): Promise<ContainerRunResult> {
     this.validateCommand(command);
-    return this.executeDocker(["exec", containerId, ...command], timeoutMs);
+    const workdir = workingDirectory && workingDirectory !== "."
+      ? ["--workdir", this.containerWorkspacePath(workingDirectory)]
+      : [];
+    return this.executeDocker(["exec", ...workdir, containerId, ...command], timeoutMs);
   }
 
   public async logs(containerId: string): Promise<ContainerRunResult> {
     return this.executeDocker(["logs", "--tail", "200", containerId], 10_000);
   }
 
+  public async isRunning(containerId: string): Promise<boolean> {
+    const result = await this.executeDocker(
+      ["inspect", "--format", "{{.State.Running}}", containerId],
+      10_000
+    );
+    return result.success && result.log.trim() === "true";
+  }
+
   public async stop(containerId: string): Promise<void> {
     await this.executeDocker(["stop", "--time", "5", containerId], 15_000);
   }
 
-  private validateCommand(command: string[]) {
-    if (command.length === 0 || command.some((part) => typeof part !== "string" || part.includes("\0"))) {
+  private validateCommand(command: string[], allowEmpty = false) {
+    if ((!allowEmpty && command.length === 0) || command.some((part) => typeof part !== "string" || part.includes("\0"))) {
       throw new Error("A non-empty validated command array is required.");
     }
   }
@@ -167,12 +215,35 @@ export class ContainerRunner {
     });
   }
 
-  private workspaceArgs(workspaceDir?: string): string[] {
+  private workspaceArgs(workspaceDir?: string, workingDirectory = "."): string[] {
     if (!workspaceDir) return [];
     return [
-      "--workdir", "/workspace",
+      "--workdir", this.containerWorkspacePath(workingDirectory),
       "--mount", `type=bind,source=${path.resolve(workspaceDir)},target=/workspace`
     ];
+  }
+
+  private containerWorkspacePath(workingDirectory: string): string {
+    const normalized = workingDirectory.replace(/\\/g, "/").replace(/^\.\/+/, "");
+    if (
+      normalized.includes("\0") ||
+      normalized.startsWith("/") ||
+      normalized === ".." ||
+      normalized.startsWith("../")
+    ) {
+      throw new Error(`Invalid workspace working directory ${workingDirectory}.`);
+    }
+    return normalized === "." || normalized === "" ? "/workspace" : `/workspace/${normalized}`;
+  }
+
+  private resolveWorkspacePath(workspaceDir: string, relativePath: string): string {
+    this.containerWorkspacePath(relativePath);
+    const root = path.resolve(workspaceDir);
+    const candidate = path.resolve(root, relativePath);
+    if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
+      throw new Error(`Workspace path escapes the repository: ${relativePath}`);
+    }
+    return candidate;
   }
 
   private userArgs(user: string | null | undefined): string[] {
@@ -187,6 +258,12 @@ export class ContainerRunner {
 
   private networkName(sandboxId: string): string {
     return `opspilot-${sandboxId}`.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").slice(0, 63);
+  }
+
+  private imageName(sandboxId: string, serviceName: string): string {
+    const cleanSandbox = sandboxId.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").slice(0, 40);
+    const cleanService = serviceName.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").slice(0, 40);
+    return `opspilot/${cleanSandbox}/${cleanService}:latest`;
   }
 
   private async inspectPort(containerId: string, containerPort: number, alias = "application"): Promise<PortBinding> {
