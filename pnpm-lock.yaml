@@ -69,6 +69,9 @@ importers:
       '@opspilot/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@opspilot/evaluation-worker':
+        specifier: workspace:*
+        version: link:../evaluation-worker
       '@opspilot/remediation-engine':
         specifier: workspace:*
         version: link:../../packages/remediation-engine
@@ -170,12 +173,18 @@ importers:
       '@opspilot/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@opspilot/repository-intelligence':
+        specifier: workspace:*
+        version: link:../../packages/repository-intelligence
       '@opspilot/schemas':
         specifier: workspace:*
         version: link:../../packages/schemas
       '@opspilot/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@opspilot/workflow-engine':
+        specifier: workspace:*
+        version: link:../../packages/workflow-engine
       bullmq:
         specifier: ^5.8.0
         version: 5.79.0

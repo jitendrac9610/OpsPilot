@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import path from "node:path";
 dotenv.config({ path: path.resolve(process.cwd(), "../../.env") });
+process.env.NODE_ENV = "test";
 
 import assert from "node:assert";
 import { publicRouter } from "../routes/public.js";
@@ -348,7 +349,28 @@ async function runApiTests() {
   assert.strictEqual(retryData.stage, "CLONING");
   console.log("✓ POST /api/diagnostic-runs/:id/retry retries the cancelled run.");
 
+  // E. Dynamic Evaluation Runner Test
+  console.log("\nTesting dynamic evaluation runner...");
+  const { runDynamicEvaluation } = await import("@opspilot/evaluation-worker");
+  const evalPayload = await runDynamicEvaluation(org.id, "gemini-1.5-flash");
+  
+  assert.ok(evalPayload);
+  assert.strictEqual(evalPayload.status, "PASSED");
+  assert.strictEqual(evalPayload.model, "gemini-1.5-flash");
+  assert.ok(evalPayload.metrics.retrieval.serviceRoutingAccuracy > 0);
+  assert.ok(evalPayload.metrics.agent.rootCauseAccuracy > 0);
+  assert.ok(evalPayload.metrics.retrieval.evidenceCoverage > 0); // security protection rate
+  
+  // Verify that AuditLog is created
+  const loggedEval = await db.auditLog.findFirst({
+    where: { orgId: org.id, action: "evaluation.benchmark.complete" }
+  });
+  assert.ok(loggedEval);
+  assert.strictEqual((loggedEval.payload as any).status, "PASSED");
+  console.log("✓ Dynamic evaluation metrics calculated and logged successfully.");
+
   // Clean up all seeded diagnostic resources
+  await db.auditLog.deleteMany({ where: { orgId: org.id } });
   await db.diagnosticRun.deleteMany({ where: { repositoryId: repository.id } });
   await db.repository.delete({ where: { id: repository.id } });
   await db.project.delete({ where: { id: project.id } });

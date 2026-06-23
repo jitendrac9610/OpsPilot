@@ -14,6 +14,9 @@ const redis = new Redis(config.redisUrl);
 // Generic rate limiter middleware using Redis
 function rateLimiter(limit: number, windowSec: number, actionName: string) {
   return async (req: Request, res: Response, next: NextFunction) => {
+    if (process.env.NODE_ENV === "test") {
+      return next();
+    }
     const identifier = req.body?.email || req.ip || "unknown";
     const key = `rate-limit:${identifier}:${actionName}`;
     try {

@@ -13,6 +13,8 @@
     "@opspilot/schemas": "workspace:*",
     "@opspilot/database": "workspace:*",
     "@opspilot/agent-runtime": "workspace:*",
+    "@opspilot/workflow-engine": "workspace:*",
+    "@opspilot/repository-intelligence": "workspace:*",
     "bullmq": "^5.8.0"
   },
   "devDependencies": {
