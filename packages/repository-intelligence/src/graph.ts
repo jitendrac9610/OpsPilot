@@ -383,8 +383,142 @@ export function buildArchitectureGraph(
           });
         }
       }
+
+      // Special Connection Rule 5: WebSocket events
+      if (sym.kind === "event" && sym.name.startsWith("WebSocket ")) {
+        let eventName = "";
+        let isListen = false;
+        let isJoin = false;
+
+        if (sym.name.startsWith("WebSocket Listen: ")) {
+          eventName = sym.name.replace("WebSocket Listen: ", "");
+          isListen = true;
+        } else if (sym.name.startsWith("WebSocket Emit: ")) {
+          eventName = sym.name.replace("WebSocket Emit: ", "");
+        } else if (sym.name.startsWith("WebSocket Join: ")) {
+          eventName = sym.name.replace("WebSocket Join: ", "");
+          isJoin = true;
+        }
+
+        if (eventName) {
+          const wsNodeId = `ws_event_${eventName.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+          addNode({
+            id: wsNodeId,
+            type: "queue/topic/event",
+            name: `WebSocket Event: ${eventName}`,
+            metadata: { eventName, protocol: "websocket" }
+          });
+
+          if (isListen) {
+            addEdge({
+              id: `ws-listen-${eventName}-${symNodeId}`,
+              source: wsNodeId,
+              target: symNodeId,
+              type: "CONSUMES_FROM",
+              evidence: { file: standardPath, line: sym.line, description: `Listens to WebSocket event: ${eventName}` }
+            });
+          } else if (isJoin) {
+            addEdge({
+              id: `ws-join-${eventName}-${symNodeId}`,
+              source: symNodeId,
+              target: wsNodeId,
+              type: "PUBLISHES_TO",
+              evidence: { file: standardPath, line: sym.line, description: `Joins WebSocket room: ${eventName}` }
+            });
+          } else {
+            addEdge({
+              id: `ws-emit-${eventName}-${symNodeId}`,
+              source: symNodeId,
+              target: wsNodeId,
+              type: "PUBLISHES_TO",
+              evidence: { file: standardPath, line: sym.line, description: `Emits WebSocket event: ${eventName}` }
+            });
+          }
+        }
+      }
+
+      // Special Connection Rule 6: Webhooks
+      if (sym.kind === "webhook") {
+        let provider = "custom";
+        if (sym.name.startsWith("Webhook Signature: ")) {
+          provider = sym.name.replace("Webhook Signature: ", "");
+        } else if (sym.name.startsWith("Webhook: ")) {
+          provider = sym.name.replace("Webhook: ", "");
+        }
+
+        const webhookNodeId = `webhook_${provider}`;
+        addNode({
+          id: webhookNodeId,
+          type: "external SDK",
+          name: `${provider} Webhook`,
+          metadata: { provider }
+        });
+
+        addEdge({
+          id: `webhook-verify-${provider}-${symNodeId}`,
+          source: webhookNodeId,
+          target: symNodeId,
+          type: "CALLS",
+          evidence: { file: standardPath, line: sym.line, description: `Verifies ${provider} webhook signature` }
+        });
+      }
+    }
+  }
+
+  // 5. Connect HTTP routes to queues, webhooks, and websocket events using word-sharing heuristics
+  const routeNodes = nodes.filter(n => n.type === "route");
+  const queueEventNodes = nodes.filter(n => n.type === "queue/topic/event");
+  const webhookNodes = nodes.filter(n => n.type === "external SDK" && n.id.startsWith("webhook_"));
+
+  for (const routeNode of routeNodes) {
+    for (const qeNode of queueEventNodes) {
+      const qeName = qeNode.metadata?.queueName || qeNode.metadata?.eventName || qeNode.name;
+      if (shareSignificantWord(routeNode.name, qeName)) {
+        addEdge({
+          id: `route-to-event-${routeNode.id}-${qeNode.id}`,
+          source: routeNode.id,
+          target: qeNode.id,
+          type: "PUBLISHES_TO",
+          evidence: {
+            file: routeNode.metadata?.relativePath || "architecture",
+            line: routeNode.metadata?.line || 1,
+            description: `HTTP route ${routeNode.name} publishes to queue/event ${qeName}`
+          }
+        });
+      }
+    }
+
+    for (const whNode of webhookNodes) {
+      const whProvider = whNode.metadata?.provider || whNode.name;
+      if (shareSignificantWord(routeNode.name, whProvider)) {
+        addEdge({
+          id: `webhook-to-route-${whNode.id}-${routeNode.id}`,
+          source: whNode.id,
+          target: routeNode.id,
+          type: "CALLS",
+          evidence: {
+            file: routeNode.metadata?.relativePath || "architecture",
+            line: routeNode.metadata?.line || 1,
+            description: `Incoming webhook ${whProvider} calls endpoint ${routeNode.name}`
+          }
+        });
+      }
     }
   }
 
   return { nodes, edges };
+}
+
+function shareSignificantWord(a: string, b: string): boolean {
+  const clean = (str: string) => str.toLowerCase().replace(/[^a-z0-9]/g, " ").split(/\s+/).filter(w => w.length >= 4);
+  const wordsA = clean(a);
+  const wordsB = clean(b);
+  for (const wA of wordsA) {
+    for (const wB of wordsB) {
+      if (wA === wB || wA + "s" === wB || wB + "s" === wA || wA.slice(0, -1) === wB || wB.slice(0, -1) === wA) {
+        return true;
+      }
+    }
+  }
+  return false;
 }

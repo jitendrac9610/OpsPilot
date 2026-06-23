@@ -101,24 +101,9 @@ app.post("/index", async (req: Request, res: Response, next: NextFunction) => {
     // 4. Download ZIP from Storage
     const zipBuffer = await storage.downloadSnapshot(archiveUrl);
 
-    // 5. Extract ZIP
-    fs.mkdirSync(tempUnzipDir, { recursive: true });
-    const directory = await unzipper.Open.buffer(zipBuffer);
-    if (directory.files.length > config.sandbox.maxArchiveFiles) {
-      throw new Error(`Snapshot contains too many files (${directory.files.length})`);
-    }
-    for (const entry of directory.files) {
-      const normalized = path.posix.normalize(entry.path.replace(/\\/g, "/"));
-      if (
-        normalized.startsWith("/") ||
-        normalized === ".." ||
-        normalized.startsWith("../") ||
-        /^[a-zA-Z]:/.test(normalized)
-      ) {
-        throw new Error(`Unsafe snapshot archive path: ${entry.path}`);
-      }
-    }
-    await directory.extract({ path: tempUnzipDir });
+    // 5. Extract ZIP safely
+    const { extractArchiveSafely } = await import("@opspilot/shared");
+    await extractArchiveSafely(zipBuffer, tempUnzipDir);
 
     // 6. Scan files recursively
     const relativeFiles = await getFilesRecursively(tempUnzipDir);

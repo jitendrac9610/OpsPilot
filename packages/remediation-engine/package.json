@@ -12,8 +12,7 @@
   "dependencies": {
     "@opspilot/shared": "workspace:*",
     "@opspilot/schemas": "workspace:*",
-    "@opspilot/database": "workspace:*",
-    "@opspilot/workflow-engine": "workspace:*"
+    "@opspilot/database": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.4.5",

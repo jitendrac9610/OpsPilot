@@ -16,6 +16,45 @@ export async function createCommitSnapshot(
 
   logger.info({ repositoryId, gitUrl, commitSha, branch }, "Initiating commit snapshot archiving");
 
+  const existingSnapshot = await prisma.repositorySnapshot.findFirst({
+    where: { repositoryId, commitSha }
+  });
+
+  if (existingSnapshot) {
+    logger.info({ repositoryId, commitSha, archiveUrl: existingSnapshot.archiveUrl }, "Snapshot already exists. Reusing it.");
+    
+    await EventBus.publish({
+      id: generateId("evt"),
+      name: "repository.snapshot.created",
+      organizationId: "system",
+      projectId: "system",
+      environment: "development",
+      sourceEntity: "github-worker",
+      commitSha,
+      correlationId: generateCorrelationId(),
+      idempotencyKey: generateIdempotencyKey(),
+      timestamp: new Date().toISOString(),
+      data: {
+        snapshotId: existingSnapshot.id,
+        repositoryId,
+        commitSha,
+        archiveUrl: existingSnapshot.archiveUrl
+      }
+    });
+
+    fetch(`${config.services.discoveryWorkerUrl}/discover`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repositoryId,
+        commitSha,
+        archiveUrl: existingSnapshot.archiveUrl
+      })
+    }).catch(err => logger.error({ err }, "Failed to trigger discovery-worker"));
+
+    return existingSnapshot.archiveUrl;
+  }
+
   try {
     // 1. Check for mock Git URL
     if (config.isDemoMode && (gitUrl.startsWith("mock_") || gitUrl.includes("mock-repo"))) {

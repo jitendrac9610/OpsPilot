@@ -90,6 +90,7 @@ model Repository {
   project            Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
   githubInstallation GitHubInstallation?
   snapshots          RepositorySnapshot[]
+  diagnosticRuns     DiagnosticRun[]
 }
 
 model GitHubInstallation {
@@ -172,15 +173,40 @@ model FeatureFlag {
 // ==========================================
 
 model RepositorySnapshot {
-  id           String     @id @default(cuid())
-  repositoryId String
-  commitSha    String
-  archiveUrl   String
-  createdAt    DateTime   @default(now())
-  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
-  sandboxes    Sandbox[]
+  id             String          @id @default(cuid())
+  repositoryId   String
+  commitSha      String
+  archiveUrl     String
+  createdAt      DateTime        @default(now())
+  repository     Repository      @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  sandboxes      Sandbox[]
+  diagnosticRuns DiagnosticRun[]
 
   @@index([repositoryId, createdAt])
+}
+
+model DiagnosticRun {
+  id                 String              @id @default(cuid())
+  repositoryId       String
+  repository         Repository          @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  snapshotId         String?
+  snapshot           RepositorySnapshot? @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  status             String              // PENDING, RUNNING, COMPLETED, FAILED, CANCELLED
+  stage              String              // CLONING, DISCOVERING, INDEXING, SANDBOX_PROVISION, SANDBOX_START, BOOTSTRAP_AUTH, PLANNING_WORKFLOW, EXECUTING_WORKFLOW, LOCALIZING_FAILURE, FINISHED
+  discoveredServices Json?
+  contracts          Json?
+  workflows          Json?
+  executedSteps      Json?
+  findings           Json?
+  artifacts          Json?
+  rootCause          String?
+  remediationStatus  String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  completedAt        DateTime?
+
+  @@index([repositoryId])
+  @@index([status])
 }
 
 model RepositoryWorkspace {

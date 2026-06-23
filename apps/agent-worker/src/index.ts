@@ -5,7 +5,7 @@ import { AgentOrchestrator } from "@opspilot/agent-runtime";
 const QUEUE_NAME = "agent-runs";
 
 export async function startWorker() {
-  logger.info({ queue: QUEUE_NAME, redisUrl: config.redisUrl }, "Starting agent worker...");
+  logger.info({ redisUrl: config.redisUrl }, "Starting agent and diagnostic workers...");
 
   try {
     const redisUrl = new URL(config.redisUrl);
@@ -17,8 +17,8 @@ export async function startWorker() {
       db: parseInt(redisUrl.pathname.replace("/", "") || "0", 10)
     };
 
-    const worker = new Worker(
-      QUEUE_NAME,
+    const agentWorker = new Worker(
+      "agent-runs",
       async (job: Job) => {
         logger.info({ jobId: job.id, data: job.data }, "Processing agent run job");
         const { goal, agentRunId, workflowRunId, incidentId, snapshotId, isProduction } = job.data;
@@ -43,17 +43,45 @@ export async function startWorker() {
       { connection }
     );
 
-    worker.on("completed", (job) => {
-      logger.info({ jobId: job.id }, "Job completed successfully");
+    agentWorker.on("completed", (job) => {
+      logger.info({ jobId: job.id }, "Agent run job completed successfully");
     });
 
-    worker.on("failed", (job, err) => {
-      logger.error({ jobId: job?.id, err }, "Job failed with error");
+    agentWorker.on("failed", (job, err) => {
+      logger.error({ jobId: job?.id, err }, "Agent run job failed with error");
     });
 
-    return worker;
+    const diagnosticWorker = new Worker(
+      "diagnostic-runs",
+      async (job: Job) => {
+        logger.info({ jobId: job.id, data: job.data }, "Processing diagnostic run job");
+        const { diagnosticRunId } = job.data;
+
+        if (!diagnosticRunId) {
+          throw new Error("Missing diagnosticRunId parameter for diagnostic run job");
+        }
+
+        const { DiagnosticRunOrchestrator } = await import("@opspilot/workflow-engine");
+        const orchestrator = new DiagnosticRunOrchestrator(diagnosticRunId);
+        await orchestrator.run();
+
+        logger.info({ jobId: job.id, diagnosticRunId }, "Finished processing diagnostic run job");
+        return { status: "done" };
+      },
+      { connection }
+    );
+
+    diagnosticWorker.on("completed", (job) => {
+      logger.info({ jobId: job.id }, "Diagnostic run job completed successfully");
+    });
+
+    diagnosticWorker.on("failed", (job, err) => {
+      logger.error({ jobId: job?.id, err }, "Diagnostic run job failed with error");
+    });
+
+    return { agentWorker, diagnosticWorker };
   } catch (err: any) {
-    logger.warn({ err: err.message }, "BullMQ / Redis connection failed. Worker running in fallback mock mode.");
+    logger.warn({ err: err.message }, "BullMQ / Redis connection failed. Workers running in fallback mock mode.");
     return null;
   }
 }

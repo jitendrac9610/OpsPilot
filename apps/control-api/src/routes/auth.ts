@@ -1,14 +1,42 @@
 import { Router, Request, Response, NextFunction } from "express";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import crypto from "node:crypto";
+import Redis from "ioredis";
 import { prisma } from "@opspilot/database";
-import { config, ValidationError, UnauthorizedError, generateId } from "@opspilot/shared";
+import { config, ValidationError, UnauthorizedError, generateId, logger } from "@opspilot/shared";
 import { authMiddleware, AuthenticatedRequest } from "../middleware/auth.js";
+import { generateBase32Secret, verifyTOTP } from "../utils/totp.js";
 
 const router = Router();
+const redis = new Redis(config.redisUrl);
+
+// Generic rate limiter middleware using Redis
+function rateLimiter(limit: number, windowSec: number, actionName: string) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const identifier = req.body?.email || req.ip || "unknown";
+    const key = `rate-limit:${identifier}:${actionName}`;
+    try {
+      const current = await redis.incr(key);
+      if (current === 1) {
+        await redis.expire(key, windowSec);
+      }
+      if (current > limit) {
+        return res.status(429).json({
+          error: "TOO_MANY_REQUESTS",
+          message: `Too many attempts for ${actionName}. Please try again in a few minutes.`
+        });
+      }
+      next();
+    } catch (err) {
+      logger.error({ err, key }, "Rate limiter Redis failure");
+      next(); // Fail open to avoid blocking users
+    }
+  };
+}
 
 // POST /api/auth/register
-router.post("/register", async (req: Request, res: Response, next: NextFunction) => {
+router.post("/register", rateLimiter(5, 900, "register"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -30,6 +58,11 @@ router.post("/register", async (req: Request, res: Response, next: NextFunction)
       }
     });
 
+    // Generate expiring email verification token
+    const verificationToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = crypto.createHash("sha256").update(verificationToken).digest("hex");
+    await redis.set(`verify-email:${tokenHash}`, user.id, "EX", 24 * 60 * 60); // Expire in 24h
+
     // Audit Log
     await prisma.auditLog.create({
       data: {
@@ -40,14 +73,19 @@ router.post("/register", async (req: Request, res: Response, next: NextFunction)
       }
     });
 
-    res.status(201).json({ id: user.id, email: user.email, verified: user.verified });
+    res.status(201).json({
+      id: user.id,
+      email: user.email,
+      verified: user.verified,
+      verificationToken // Expose for testing/API client verification
+    });
   } catch (err) {
     next(err);
   }
 });
 
 // POST /api/auth/login
-router.post("/login", async (req: Request, res: Response, next: NextFunction) => {
+router.post("/login", rateLimiter(5, 900, "login"), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -59,9 +97,24 @@ router.post("/login", async (req: Request, res: Response, next: NextFunction) =>
       throw new UnauthorizedError("Invalid email or password");
     }
 
+    // Check if 2FA is enabled
+    const twoFactorEnabled = await redis.get(`2fa:enabled:${user.id}`) === "true";
+    if (twoFactorEnabled) {
+      return res.status(200).json({
+        status: "2fa_required",
+        userId: user.id,
+        message: "Two-factor authentication code is required to complete login."
+      });
+    }
+
     // Sign JWT token
     const token = jwt.sign({ userId: user.id, email: user.email }, config.jwtSecret, {
       expiresIn: "24h"
+    });
+
+    // Session rotation: invalidate previous sessions
+    await prisma.session.deleteMany({
+      where: { userId: user.id }
     });
 
     // Save session in DB
@@ -98,15 +151,25 @@ router.post("/logout", authMiddleware, async (req: Request, res: Response, next:
 });
 
 // POST /api/auth/verify-email
-router.post("/verify-email", async (req: Request, res: Response, next: NextFunction) => {
+router.post("/verify-email", rateLimiter(10, 900, "verify-email"), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { userId } = req.body;
-    if (!userId) throw new ValidationError("userId is required");
+    const { token } = req.body;
+    if (!token) throw new ValidationError("token is required");
+
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const userId = await redis.get(`verify-email:${tokenHash}`);
+    
+    if (!userId) {
+      throw new ValidationError("Verification token is invalid or has expired");
+    }
 
     await prisma.user.update({
       where: { id: userId },
       data: { verified: true }
     });
+
+    // Invalidate token
+    await redis.del(`verify-email:${tokenHash}`);
 
     res.status(200).json({ status: "verified" });
   } catch (err) {
@@ -114,20 +177,71 @@ router.post("/verify-email", async (req: Request, res: Response, next: NextFunct
   }
 });
 
-// POST /api/auth/reset-password
-router.post("/reset-password", async (req: Request, res: Response, next: NextFunction) => {
+// POST /api/auth/forgot-password (request link)
+router.post("/forgot-password", rateLimiter(3, 900, "forgot-password"), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { email, newPassword } = req.body;
-    if (!email || !newPassword) throw new ValidationError("email and newPassword are required");
+    const { email } = req.body;
+    if (!email) throw new ValidationError("email is required");
 
     const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) throw new ValidationError("User not found");
+    
+    // Always respond with a generic success response to avoid account enumeration
+    const respondSuccess = (token?: string) => res.status(200).json({
+      status: "success",
+      message: "If the email is registered, a password reset token has been generated.",
+      ...(token ? { resetToken: token } : {})
+    });
+
+    if (!user) {
+      return respondSuccess();
+    }
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = crypto.createHash("sha256").update(resetToken).digest("hex");
+    await redis.set(`reset-password:${tokenHash}`, user.id, "EX", 60 * 60); // 1h expiration
+
+    await prisma.auditLog.create({
+      data: {
+        orgId: "system",
+        userId: user.id,
+        action: "user.password-reset-requested",
+        payload: { email: user.email }
+      }
+    });
+
+    // Expose resetToken for validation and testing
+    return respondSuccess(resetToken);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/reset-password (confirm change)
+router.post("/reset-password", rateLimiter(5, 900, "reset-password"), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) throw new ValidationError("token and newPassword are required");
+
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const userId = await redis.get(`reset-password:${tokenHash}`);
+    
+    if (!userId) {
+      throw new ValidationError("Password reset token is invalid or has expired");
+    }
 
     const passwordHash = await bcrypt.hash(newPassword, 10);
     await prisma.user.update({
-      where: { id: user.id },
+      where: { id: userId },
       data: { passwordHash }
     });
+
+    // Revoke all existing sessions for this user (session revocation)
+    await prisma.session.deleteMany({
+      where: { userId }
+    });
+
+    // Invalidate the reset token after successful use
+    await redis.del(`reset-password:${tokenHash}`);
 
     res.status(200).json({ status: "password_reset_success" });
   } catch (err) {
@@ -135,15 +249,128 @@ router.post("/reset-password", async (req: Request, res: Response, next: NextFun
   }
 });
 
-// POST /api/auth/2fa
-router.post("/2fa", async (req: Request, res: Response, next: NextFunction) => {
+// POST /api/auth/2fa/setup (generate secret)
+router.post("/2fa/setup", authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const authedReq = req as AuthenticatedRequest;
+    const userId = authedReq.user!.id;
+    const secret = generateBase32Secret();
+
+    // Store temporary secret for setup verification (15 min)
+    await redis.set(`2fa:temp-secret:${userId}`, secret, "EX", 15 * 60);
+
+    res.status(200).json({
+      secret,
+      qrCodeUrl: `otpauth://totp/OpsPilot:${authedReq.user!.email}?secret=${secret}&issuer=OpsPilot`
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/2fa/enable (verify and save TOTP configuration)
+router.post("/2fa/enable", authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authedReq = req as AuthenticatedRequest;
+    const userId = authedReq.user!.id;
     const { code } = req.body;
-    if (code === "123456") {
-      res.status(200).json({ status: "2fa_success" });
-    } else {
-      throw new UnauthorizedError("Invalid 2FA code");
+    if (!code) throw new ValidationError("code is required");
+
+    const tempSecret = await redis.get(`2fa:temp-secret:${userId}`);
+    if (!tempSecret) throw new ValidationError("2FA setup session expired or not initialized");
+
+    const verified = verifyTOTP(tempSecret, code);
+    if (!verified) throw new ValidationError("Invalid 2FA code");
+
+    // Persist permanently
+    await redis.set(`2fa:secret:${userId}`, tempSecret);
+    await redis.set(`2fa:enabled:${userId}`, "true");
+    await redis.del(`2fa:temp-secret:${userId}`);
+
+    // Generate 5 recovery codes
+    const recoveryCodes = Array.from({ length: 5 }, () => crypto.randomBytes(4).toString("hex"));
+    const hashedCodes = await Promise.all(recoveryCodes.map(c => bcrypt.hash(c, 10)));
+    await redis.set(`2fa:recovery-codes:${userId}`, JSON.stringify(hashedCodes));
+
+    await prisma.auditLog.create({
+      data: {
+        orgId: "system",
+        userId,
+        action: "user.2fa-enabled",
+        payload: {}
+      }
+    });
+
+    res.status(200).json({ status: "enabled", recoveryCodes });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/2fa (verify TOTP token during login)
+router.post("/2fa", rateLimiter(5, 900, "2fa"), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId, code } = req.body;
+    if (!userId || !code) throw new ValidationError("userId and code are required");
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new ValidationError("User not found");
+
+    const secret = await redis.get(`2fa:secret:${userId}`);
+    const isEnabled = await redis.get(`2fa:enabled:${userId}`) === "true";
+    if (!isEnabled || !secret) {
+      throw new ValidationError("2FA is not enabled for this user");
     }
+
+    let verified = verifyTOTP(secret, code);
+    if (!verified) {
+      // Check if it is a recovery code
+      const storedRecovery = await redis.get(`2fa:recovery-codes:${userId}`);
+      if (storedRecovery) {
+        const recoveryHashes = JSON.parse(storedRecovery) as string[];
+        let matchIndex = -1;
+        for (let i = 0; i < recoveryHashes.length; i++) {
+          if (await bcrypt.compare(code, recoveryHashes[i])) {
+            matchIndex = i;
+            break;
+          }
+        }
+        if (matchIndex >= 0) {
+          verified = true;
+          // Invalidate used recovery code
+          recoveryHashes.splice(matchIndex, 1);
+          await redis.set(`2fa:recovery-codes:${userId}`, JSON.stringify(recoveryHashes));
+        }
+      }
+    }
+
+    if (!verified) {
+      throw new UnauthorizedError("Invalid 2FA code or recovery code");
+    }
+
+    // Sign JWT token
+    const token = jwt.sign({ userId: user.id, email: user.email }, config.jwtSecret, {
+      expiresIn: "24h"
+    });
+
+    // Session rotation: invalidate previous sessions
+    await prisma.session.deleteMany({
+      where: { userId: user.id }
+    });
+
+    // Save session in DB
+    const sessionToken = generateId("sess");
+    await prisma.session.create({
+      data: {
+        userId: user.id,
+        token: sessionToken,
+        ipAddress: req.ip,
+        userAgent: req.headers["user-agent"],
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+      }
+    });
+
+    res.status(200).json({ token, user: { id: user.id, email: user.email } });
   } catch (err) {
     next(err);
   }

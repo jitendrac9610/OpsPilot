@@ -54,3 +54,63 @@ export class ObjectStorage {
 }
 
 export const storage = new ObjectStorage();
+
+export async function extractArchiveSafely(archive: Buffer, destination: string): Promise<number> {
+  const { default: unzipper } = await import("unzipper");
+  const directory = await unzipper.Open.buffer(archive);
+  
+  const maxArchiveFiles = config.sandbox?.maxArchiveFiles || 20000;
+  const maxArchiveBytes = config.sandbox?.maxArchiveBytes || 1073741824; // 1GB
+  const maxFileBytes = config.sandbox?.maxFileBytes || 52428800; // 50MB
+
+  if (directory.files.length > maxArchiveFiles) {
+    throw new Error(`Archive contains too many files (${directory.files.length}); limit is ${maxArchiveFiles}`);
+  }
+
+  const destinationRoot = path.resolve(destination);
+  await fs.promises.mkdir(destinationRoot, { recursive: true });
+  let extractedBytes = 0;
+  let verified = 0;
+
+  for (const entry of directory.files) {
+    const normalized = path.posix.normalize(entry.path.replace(/\\/g, "/"));
+    if (
+      normalized === "." ||
+      normalized.includes("\0") ||
+      normalized.startsWith("/") ||
+      normalized === ".." ||
+      normalized.startsWith("../") ||
+      /^[a-zA-Z]:/.test(normalized)
+    ) {
+      throw new Error(`Unsafe archive entry path rejected: ${entry.path}`);
+    }
+
+    const target = path.resolve(destinationRoot, ...normalized.split("/"));
+    if (target !== destinationRoot && !target.startsWith(`${destinationRoot}${path.sep}`)) {
+      throw new Error(`Archive path escapes the workspace: ${entry.path}`);
+    }
+
+    if (entry.type === "Directory") {
+      await fs.promises.mkdir(target, { recursive: true });
+      continue;
+    }
+    if (entry.type !== "File") {
+      throw new Error(`Unsupported archive entry type for ${entry.path}`);
+    }
+
+    const content = await entry.buffer();
+    if (content.byteLength > maxFileBytes) {
+      throw new Error(`Archive file exceeds the per-file size limit: ${entry.path}`);
+    }
+    extractedBytes += content.byteLength;
+    if (extractedBytes > maxArchiveBytes) {
+      throw new Error("Expanded archive exceeds the configured size limit.");
+    }
+
+    await fs.promises.mkdir(path.dirname(target), { recursive: true });
+    await fs.promises.writeFile(target, content);
+    verified++;
+  }
+  return verified;
+}
+

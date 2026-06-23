@@ -32,17 +32,16 @@ app.post("/discover", async (req: Request, res: Response, next: NextFunction) =>
     return res.status(400).json({ error: "VALIDATION_ERROR", message: "repositoryId, commitSha, and archiveUrl are required" });
   }
 
-  const tempUnzipDir = path.join("c:\\Users\\jiten\\OpsPilot", "sandbox", "temp", `unzip_${generateId()}`);
+  const tempUnzipDir = path.join(config.tempRoot, `unzip_${generateId()}`);
   logger.info({ repositoryId, commitSha, archiveUrl }, "Starting technology discovery execution");
 
   try {
     // 1. Download ZIP from Storage
     const zipBuffer = await storage.downloadSnapshot(archiveUrl);
 
-    // 2. Extract ZIP
-    fs.mkdirSync(tempUnzipDir, { recursive: true });
-    const directory = await unzipper.Open.buffer(zipBuffer);
-    await directory.extract({ path: tempUnzipDir });
+    // 2. Extract ZIP safely
+    const { extractArchiveSafely } = await import("@opspilot/shared");
+    await extractArchiveSafely(zipBuffer, tempUnzipDir);
 
     // 3. Scan files recursively
     const fileList = await getFilesRecursively(tempUnzipDir);

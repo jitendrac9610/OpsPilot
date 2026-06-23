@@ -1,8 +1,20 @@
 import { Router, Response, NextFunction } from "express";
 import { prisma } from "@opspilot/database";
-import { ValidationError, ForbiddenError, logger, storage } from "@opspilot/shared";
+import { ValidationError, ForbiddenError, logger, storage, config } from "@opspilot/shared";
 import { authMiddleware, AuthenticatedRequest } from "../middleware/auth.js";
 import unzipper from "unzipper";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  WorkflowDiscoverer,
+  StatefulWorkflowPlanner,
+  AuthBootstrapper,
+  WorkflowDrivers,
+  AssertionEngine,
+  FailureLocalizer,
+  CorrelationManager
+} from "@opspilot/workflow-engine";
 
 const router = Router();
 
@@ -366,4 +378,50 @@ router.get("/:id/file", async (req: AuthenticatedRequest, res: Response, next: N
   }
 });
 
+// POST /api/repositories/:id/diagnose
+router.post("/:id/diagnose", async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const repository = await prisma.repository.findUnique({
+      where: { id },
+      include: { project: true }
+    });
+    if (!repository) throw new ValidationError("Repository not found");
+
+    // Auth Check
+    const membership = await prisma.membership.findFirst({
+      where: { organizationId: repository.project.organizationId, userId: req.user!.id }
+    });
+    if (!membership) throw new ForbiddenError();
+
+    // Create DiagnosticRun in DB
+    const diagnosticRun = await prisma.diagnosticRun.create({
+      data: {
+        repositoryId: id,
+        status: "PENDING",
+        stage: "CLONING"
+      }
+    });
+
+    // Create audit log
+    await prisma.auditLog.create({
+      data: {
+        orgId: repository.project.organizationId,
+        userId: req.user!.id,
+        action: "diagnostic_run.create",
+        payload: { repositoryId: id, diagnosticRunId: diagnosticRun.id }
+      }
+    });
+
+    // Import enqueue helper and trigger background processing
+    const { enqueueDiagnosticRun } = await import("./diagnosticRuns.js");
+    await enqueueDiagnosticRun(diagnosticRun.id);
+
+    res.status(201).json(diagnosticRun);
+  } catch (err) {
+    next(err);
+  }
+});
+
 export const repositoryRouter: Router = router;
+

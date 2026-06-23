@@ -1,3 +1,7 @@
+import dotenv from "dotenv";
+import path from "node:path";
+dotenv.config({ path: path.resolve(process.cwd(), "../../.env") });
+
 import assert from "node:assert";
 import { publicRouter } from "../routes/public.js";
 import { adminRouter } from "../routes/admin.js";
@@ -58,7 +62,306 @@ async function runApiTests() {
   );
   console.log("✓ Repository and sandbox queries include tenant ownership constraints.");
 
+  // 4. Verify Repository Diagnose Route Registration
+  console.log("\nTesting Repository Routes...");
+  const { repositoryRouter } = await import("../routes/repositories.js");
+  assert.ok(repositoryRouter);
+  const repoRoutes = (repositoryRouter as any).stack
+    .filter((layer: any) => layer.route)
+    .map((layer: any) => ({
+      path: layer.route.path,
+      methods: Object.keys(layer.route.methods)
+    }));
+  const diagnoseRoute = repoRoutes.find((r: any) => r.path === "/:id/diagnose");
+  assert.ok(diagnoseRoute, "Expected POST /:id/diagnose route to be registered");
+  assert.deepStrictEqual(diagnoseRoute.methods, ["post"]);
+  console.log("✓ /repositories/:id/diagnose orchestrator route successfully registered.");
+
+  // 5. Test Auth Security Pipeline
+  console.log("\nTesting Auth Security Pipeline...");
+  const baseUrl = `http://localhost:4000`;
+  const email = `test-security-${Date.now()}@example.com`;
+  const password = "SecurePassword123!";
+  const newPassword = "EvenMoreSecurePassword123!";
+
+  // Start API server by importing index.js
+  console.log("Starting API server for integration testing...");
+  await import("../index.js");
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  // A. Register
+  const registerRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password })
+  });
+  assert.strictEqual(registerRes.status, 201);
+  const registerData = await registerRes.json() as any;
+  assert.strictEqual(registerData.email, email);
+  assert.strictEqual(registerData.verified, false);
+  const verificationToken = registerData.verificationToken;
+  assert.ok(verificationToken);
+  console.log("✓ Registration returns unverified status and verification token.");
+
+  // B. Verify email
+  const verifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: verificationToken })
+  });
+  assert.strictEqual(verifyRes.status, 200);
+  console.log("✓ Email verification with valid token succeeds.");
+
+  // C. Verify expired/invalid email token throws
+  const verifyInvalidRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: "invalid-token" })
+  });
+  assert.strictEqual(verifyInvalidRes.status, 400);
+  console.log("✓ Email verification with invalid token fails with status 400.");
+
+  // D. Forgot password
+  const forgotRes = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email })
+  });
+  assert.strictEqual(forgotRes.status, 200);
+  const forgotData = await forgotRes.json() as any;
+  const resetToken = forgotData.resetToken;
+  assert.ok(resetToken);
+  console.log("✓ Forgot password generates reset token.");
+
+  // E. Reset password with token
+  const resetRes = await fetch(`${baseUrl}/api/auth/reset-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: resetToken, newPassword })
+  });
+  assert.strictEqual(resetRes.status, 200);
+  console.log("✓ Password reset with valid token succeeds.");
+
+  // F. Login with new password
+  const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password: newPassword })
+  });
+  assert.strictEqual(loginRes.status, 200);
+  const loginData = await loginRes.json() as any;
+  const jwtToken = loginData.token;
+  assert.ok(jwtToken);
+  console.log("✓ Login with new password succeeds.");
+
+  // G. Invalidate old sessions/cookies - verify logout
+  const logoutRes = await fetch(`${baseUrl}/api/auth/logout`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${jwtToken}`
+    }
+  });
+  assert.strictEqual(logoutRes.status, 200);
+  console.log("✓ Logout revokes user session.");
+
+  // Re-login to get a fresh token for 2FA setup
+  const reloginRes = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password: newPassword })
+  });
+  const reloginData = await reloginRes.json() as any;
+  const loginToken = reloginData.token;
+
+  // H. Setup 2FA
+  const setupRes = await fetch(`${baseUrl}/api/auth/2fa/setup`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${loginToken}`
+    }
+  });
+  assert.strictEqual(setupRes.status, 200);
+  const setupData = await setupRes.json() as any;
+  const twoFactorSecret = setupData.secret;
+  assert.ok(twoFactorSecret);
+  console.log("✓ 2FA setup generates secret.");
+
+  // Generate valid TOTP code
+  const { generateTOTP } = await import("../utils/totp.js");
+  const totpCode = generateTOTP(twoFactorSecret);
+
+  // I. Enable 2FA
+  const enableRes = await fetch(`${baseUrl}/api/auth/2fa/enable`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${loginToken}`
+    },
+    body: JSON.stringify({ code: totpCode })
+  });
+  assert.strictEqual(enableRes.status, 200);
+  const enableData = await enableRes.json() as any;
+  assert.ok(enableData.recoveryCodes.length > 0);
+  const recoveryCode = enableData.recoveryCodes[0];
+  console.log("✓ 2FA enable with valid TOTP code succeeds and returns recovery codes.");
+
+  // J. Login again - should require 2FA
+  const login2faReqRes = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password: newPassword })
+  });
+  assert.strictEqual(login2faReqRes.status, 200);
+  const login2faReqData = await login2faReqRes.json() as any;
+  assert.strictEqual(login2faReqData.status, "2fa_required");
+  const loginUserId = login2faReqData.userId;
+  assert.ok(loginUserId);
+  console.log("✓ Login with 2FA enabled returns 2fa_required status.");
+
+  // K. Verify 2FA code to get token
+  const finalTotp = generateTOTP(twoFactorSecret);
+  const verify2faRes = await fetch(`${baseUrl}/api/auth/2fa`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ userId: loginUserId, code: finalTotp })
+  });
+  assert.strictEqual(verify2faRes.status, 200);
+  const verify2faData = await verify2faRes.json() as any;
+  assert.ok(verify2faData.token);
+  console.log("✓ Verifying valid 2FA TOTP code completes login and issues token.");
+
+  // L. Verify recovery code login
+  const recoveryLoginReq = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password: newPassword })
+  });
+  const recoveryLoginData = await recoveryLoginReq.json() as any;
+  const verifyRecoveryRes = await fetch(`${baseUrl}/api/auth/2fa`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ userId: recoveryLoginData.userId, code: recoveryCode })
+  });
+  assert.strictEqual(verifyRecoveryRes.status, 200);
+  const verifyRecoveryData = await verifyRecoveryRes.json() as any;
+  assert.ok(verifyRecoveryData.token);
+  console.log("✓ Verifying valid 2FA recovery code completes login and issues token.");
+
+  // 6. Test Diagnostic Runs Integration Pipeline
+  console.log("\nTesting Diagnostic Runs integration...");
+  const { prisma: db } = await import("@opspilot/database");
+  
+  // Find or create organization
+  const org = await db.organization.create({
+    data: { name: "Test Org" }
+  });
+  
+  // Find user ID from our tested login/user
+  const testUserObj = await db.user.findFirst({ where: { email } });
+  if (!testUserObj) throw new Error("Test user not found");
+
+  // Create membership
+  const role = await db.role.upsert({
+    where: { name: "ADMIN" },
+    update: {},
+    create: { id: "admin", name: "ADMIN", description: "Admin role" }
+  });
+  await db.membership.create({
+    data: {
+      organizationId: org.id,
+      userId: testUserObj.id,
+      roleId: role.id
+    }
+  });
+
+  // Create project
+  const project = await db.project.create({
+    data: {
+      organizationId: org.id,
+      name: "Test Project"
+    }
+  });
+
+  // Create repository
+  const repository = await db.repository.create({
+    data: {
+      projectId: project.id,
+      name: "test-repo",
+      gitUrl: "mock-repo-url",
+      branch: "main"
+    }
+  });
+
+  // A. Trigger diagnosis via API
+  const diagnoseResponse = await fetch(`${baseUrl}/api/repositories/${repository.id}/diagnose`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${loginToken}`
+    }
+  });
+  assert.strictEqual(diagnoseResponse.status, 201);
+  const runData = await diagnoseResponse.json() as any;
+  assert.strictEqual(runData.status, "PENDING");
+  assert.strictEqual(runData.stage, "CLONING");
+  assert.strictEqual(runData.repositoryId, repository.id);
+  const runId = runData.id;
+  assert.ok(runId);
+  console.log("✓ Creating diagnostic run enqueues a background job.");
+
+  // B. Get diagnostic run details
+  const getRunRes = await fetch(`${baseUrl}/api/diagnostic-runs/${runId}`, {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${loginToken}`
+    }
+  });
+  assert.strictEqual(getRunRes.status, 200);
+  const getRunData = await getRunRes.json() as any;
+  assert.strictEqual(getRunData.id, runId);
+  console.log("✓ GET /api/diagnostic-runs/:id returns correct status.");
+
+  // C. Cancel diagnostic run
+  const cancelRes = await fetch(`${baseUrl}/api/diagnostic-runs/${runId}/cancel`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${loginToken}`
+    }
+  });
+  assert.strictEqual(cancelRes.status, 200);
+  const cancelData = await cancelRes.json() as any;
+  assert.strictEqual(cancelData.status, "CANCELLED");
+  console.log("✓ POST /api/diagnostic-runs/:id/cancel cancels the run.");
+
+  // D. Retry diagnostic run
+  const retryRes = await fetch(`${baseUrl}/api/diagnostic-runs/${runId}/retry`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${loginToken}`
+    }
+  });
+  assert.strictEqual(retryRes.status, 201);
+  const retryData = await retryRes.json() as any;
+  assert.strictEqual(retryData.status, "PENDING");
+  assert.strictEqual(retryData.stage, "CLONING");
+  console.log("✓ POST /api/diagnostic-runs/:id/retry retries the cancelled run.");
+
+  // Clean up all seeded diagnostic resources
+  await db.diagnosticRun.deleteMany({ where: { repositoryId: repository.id } });
+  await db.repository.delete({ where: { id: repository.id } });
+  await db.project.delete({ where: { id: project.id } });
+  await db.membership.deleteMany({ where: { organizationId: org.id } });
+  await db.organization.delete({ where: { id: org.id } });
+  console.log("✓ Cleaned up all seeded diagnostic test resources.");
+
+  // Cleanup test user
+  await db.user.delete({ where: { email } });
+  console.log("✓ Cleaned up security test user.");
+
   console.log("\nALL API ROUTE CHECKS PASSED!");
+  process.exit(0);
 }
 
 runApiTests().catch((err) => {

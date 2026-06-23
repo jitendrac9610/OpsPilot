@@ -13,6 +13,7 @@
     "@opspilot/database": "workspace:*",
     "@opspilot/schemas": "workspace:*",
     "@opspilot/shared": "workspace:*",
+    "@opspilot/remediation-engine": "workspace:*",
     "ioredis": "^5.11.1",
     "mongodb": "^7.3.0",
     "pg": "^8.22.0",

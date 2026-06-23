@@ -6,3 +6,4 @@ export * from "./localization.js";
 export * from "./authBootstrapper.js";
 export * from "./requestGenerator.js";
 export * from "./statefulPlanner.js";
+export * from "./diagnosticOrchestrator.js";

@@ -12,6 +12,7 @@ import { publicRouter } from "./routes/public.js";
 import { adminRouter } from "./routes/admin.js";
 import { evaluationRouter } from "./routes/evaluation.js";
 import { sandboxRouter } from "./routes/sandbox.js";
+import { diagnosticRunsRouter } from "./routes/diagnosticRuns.js";
 
 const app = express();
 
@@ -23,6 +24,7 @@ app.use("/api/auth", authRouter);
 app.use("/api/organizations", orgRouter);
 app.use("/api/projects", projectRouter);
 app.use("/api/repositories", repositoryRouter);
+app.use("/api/diagnostic-runs", diagnosticRunsRouter);
 app.use("/api", billingRouter);
 app.use("/api/audit-logs", auditRouter);
 app.use("/api/incidents", incidentRouter);

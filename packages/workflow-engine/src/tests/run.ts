@@ -291,6 +291,95 @@ export default router;
   const boundaryId = await localizer.localizeFailure(runId, "POST /api/orders", "HTTP 500");
   assert(boundaryId.startsWith("fb-"));
 
+  console.log("\nTesting Phase 4: AST parsing extensions...");
+  const phase4File = path.join(repositoryRoot, "src/phase4-test.ts");
+  await fs.promises.writeFile(phase4File, `
+import { io, socket } from "socket.io-client";
+import stripe from "stripe";
+
+// WebSocket tests
+socket.on("refund-completed", (data) => {
+  console.log("refund done", data);
+});
+socket.emit("request-refund", { id: 123 });
+socket.join("room-123");
+
+// Webhook signature checks
+const sig = req.headers["stripe-signature"];
+stripe.webhooks.constructEvent(req.body, sig, "secret");
+
+const razorpaySig = req.headers["x-razorpay-signature"];
+  `);
+
+  const { parseFile } = await import("@opspilot/repository-intelligence");
+  const parseRes = parseFile("TypeScript", "src/phase4-test.ts", phase4File);
+  
+  const wsListen = parseRes.symbols.find(s => s.name === "WebSocket Listen: refund-completed");
+  const wsEmit = parseRes.symbols.find(s => s.name === "WebSocket Emit: request-refund");
+  const wsJoin = parseRes.symbols.find(s => s.name === "WebSocket Join: room-123");
+  const webhookStripe = parseRes.symbols.find(s => s.name === "Webhook: stripe");
+  const webhookSignature = parseRes.symbols.find(s => s.name === "Webhook Signature: stripe");
+  
+  assert.ok(wsListen, "Expected WebSocket Listen: refund-completed");
+  assert.ok(wsEmit, "Expected WebSocket Emit: request-refund");
+  assert.ok(wsJoin, "Expected WebSocket Join: room-123");
+  assert.ok(webhookStripe, "Expected Webhook: stripe");
+  assert.ok(webhookSignature, "Expected Webhook Signature: stripe");
+  console.log("✓ WebSocket & Webhook AST extraction verified.");
+
+  console.log("\nTesting Phase 4: Queue producer-consumer graph building & word-sharing...");
+  const { buildArchitectureGraph } = await import("@opspilot/repository-intelligence");
+  const filesFixture = [
+    {
+      relativePath: "src/api.ts",
+      language: "TypeScript",
+      symbols: [
+        { name: "POST /api/interviews", kind: "route", line: 1, startLine: 1, endLine: 10 },
+        { name: "Queue: interviews-queue", kind: "queue producer", line: 5, startLine: 5, endLine: 5 }
+      ]
+    },
+    {
+      relativePath: "src/worker.ts",
+      language: "TypeScript",
+      symbols: [
+        { name: "Worker: interview-queue", kind: "queue consumer", line: 1, startLine: 1, endLine: 10 }
+      ]
+    }
+  ];
+
+  const graph = buildArchitectureGraph(repositoryRoot, "snap-123", filesFixture);
+  
+  const queue1 = graph.nodes.find(n => n.id === "queue_interviews-queue");
+  const queue2 = graph.nodes.find(n => n.id === "queue_interview-queue");
+  assert.ok(queue1, "Expected queue_interviews-queue node");
+  assert.ok(queue2, "Expected queue_interview-queue node");
+
+  const routeNode = graph.nodes.find(n => n.type === "route");
+  assert.ok(routeNode, "Expected route node");
+
+  const edgeToQueue1 = graph.edges.find(e => e.source === routeNode.id && e.target === queue1.id);
+  const edgeToQueue2 = graph.edges.find(e => e.source === routeNode.id && e.target === queue2.id);
+  assert.ok(edgeToQueue1, "Expected PUBLISHES_TO edge from route to queue_interviews-queue");
+  assert.ok(edgeToQueue2, "Expected PUBLISHES_TO edge from route to queue_interview-queue");
+  console.log("✓ Word-sharing route-to-queue connections verified.");
+
+  console.log("\nTesting Phase 4: Hypothesis-driven Failure Localizer...");
+  const hypotheses = await (localizer as any).generateHypotheses(
+    "Error: Webhook Error: signature verification failed",
+    undefined,
+    graph.nodes,
+    graph.edges
+  );
+
+  const queueHypothesis = hypotheses.find((h: any) => h.description.includes("queue-name mismatch"));
+  const webhookHypothesis = hypotheses.find((h: any) => h.description.includes("signature verification failure"));
+  
+  assert.ok(queueHypothesis, "Expected queue-name mismatch hypothesis");
+  assert.strictEqual(queueHypothesis.status, "SUPPORTED");
+  assert.ok(webhookHypothesis, "Expected signature verification failure hypothesis");
+  assert.strictEqual(webhookHypothesis.status, "SUPPORTED");
+  console.log("✓ Hypothesis-driven failure localization verified.");
+
   await fs.promises.rm(repositoryRoot, { recursive: true, force: true });
   console.log("ALL WORKFLOW ENGINE TESTS PASSED");
 }

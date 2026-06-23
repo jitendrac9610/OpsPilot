@@ -204,70 +204,15 @@ export class SandboxManager {
   }
 
   private async extractSafely(archive: Buffer, destination: string) {
-    const directory = await unzipper.Open.buffer(archive);
-    if (directory.files.length > config.sandbox.maxArchiveFiles) {
+    const { extractArchiveSafely } = await import("@opspilot/shared");
+    try {
+      await extractArchiveSafely(archive, destination);
+    } catch (error: any) {
       throw new SandboxProvisionError(
         "SNAPSHOT_EXTRACTION_FAILED",
-        `Snapshot contains ${directory.files.length} files; limit is ${config.sandbox.maxArchiveFiles}.`
+        error.message || "Could not safely extract snapshot.",
+        error
       );
-    }
-
-    const destinationRoot = path.resolve(destination);
-    await fs.promises.mkdir(destinationRoot, { recursive: true });
-    let extractedBytes = 0;
-
-    for (const entry of directory.files) {
-      const normalized = path.posix.normalize(entry.path.replace(/\\/g, "/"));
-      if (
-        normalized === "." ||
-        normalized.includes("\0") ||
-        normalized.startsWith("/") ||
-        normalized === ".." ||
-        normalized.startsWith("../") ||
-        /^[a-zA-Z]:/.test(normalized)
-      ) {
-        throw new SandboxProvisionError(
-          "SNAPSHOT_EXTRACTION_FAILED",
-          `Unsafe archive path rejected: ${entry.path}`
-        );
-      }
-
-      const target = path.resolve(destinationRoot, ...normalized.split("/"));
-      if (target !== destinationRoot && !target.startsWith(`${destinationRoot}${path.sep}`)) {
-        throw new SandboxProvisionError(
-          "SNAPSHOT_EXTRACTION_FAILED",
-          `Archive path escapes the workspace: ${entry.path}`
-        );
-      }
-
-      if (entry.type === "Directory") {
-        await fs.promises.mkdir(target, { recursive: true });
-        continue;
-      }
-      if (entry.type !== "File") {
-        throw new SandboxProvisionError(
-          "SNAPSHOT_EXTRACTION_FAILED",
-          `Unsupported archive entry type for ${entry.path}.`
-        );
-      }
-
-      const content = await entry.buffer();
-      if (content.byteLength > config.sandbox.maxFileBytes) {
-        throw new SandboxProvisionError(
-          "SNAPSHOT_EXTRACTION_FAILED",
-          `Archive file exceeds the per-file size limit: ${entry.path}`
-        );
-      }
-      extractedBytes += content.byteLength;
-      if (extractedBytes > config.sandbox.maxArchiveBytes) {
-        throw new SandboxProvisionError(
-          "SNAPSHOT_EXTRACTION_FAILED",
-          "Expanded snapshot exceeds the configured size limit."
-        );
-      }
-
-      await fs.promises.mkdir(path.dirname(target), { recursive: true });
-      await fs.promises.writeFile(target, content, { flag: "wx" });
     }
   }
 

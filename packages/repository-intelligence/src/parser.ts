@@ -281,6 +281,83 @@ function parseTypeScript(content: string, relativePath: string, absolutePath: st
             });
           }
         }
+
+        // WebSocket logic: socket.on, socket.emit, io.emit, ws.on, ws.send, socket.join
+        const baseText = ts.isIdentifier(baseObj) ? baseObj.text : "";
+        if (
+          (baseText === "socket" || baseText === "io" || baseText === "ws" || baseText === "conn") &&
+          (propName === "on" || propName === "emit" || propName === "send" || propName === "join")
+        ) {
+          const firstArg = node.arguments[0];
+          if (firstArg && ts.isStringLiteral(firstArg)) {
+            const eventName = firstArg.text;
+            const startLine = getLineFromPos(sourceFile, node.getStart());
+            const endLine = getLineFromPos(sourceFile, node.getEnd());
+            let kind = "event";
+            let symName = "";
+            if (propName === "on") {
+              symName = `WebSocket Listen: ${eventName}`;
+            } else if (propName === "emit" || propName === "send") {
+              symName = `WebSocket Emit: ${eventName}`;
+            } else if (propName === "join") {
+              symName = `WebSocket Join: ${eventName}`;
+            }
+            if (symName) {
+              symbols.push({
+                name: symName,
+                kind,
+                line: startLine,
+                startLine,
+                endLine
+              });
+            }
+          }
+        }
+
+        // Webhook stripe logic: stripe.webhooks.constructEvent(...)
+        if (propName === "constructEvent") {
+          let isStripe = false;
+          if (ts.isPropertyAccessExpression(baseObj)) {
+            const clientObj = baseObj.expression;
+            const subProp = baseObj.name.text;
+            if (ts.isIdentifier(clientObj) && clientObj.text === "stripe" && subProp === "webhooks") {
+              isStripe = true;
+            }
+          }
+          if (isStripe) {
+            const startLine = getLineFromPos(sourceFile, node.getStart());
+            const endLine = getLineFromPos(sourceFile, node.getEnd());
+            symbols.push({
+              name: "Webhook: stripe",
+              kind: "webhook",
+              line: startLine,
+              startLine,
+              endLine
+            });
+          }
+        }
+      }
+    }
+
+    // Header signature check detection
+    if (ts.isElementAccessExpression(node)) {
+      const arg = node.argumentExpression;
+      if (arg && ts.isStringLiteral(arg)) {
+        const text = arg.text.toLowerCase();
+        if (text === "stripe-signature" || text === "x-hub-signature-256" || text === "x-hub-signature" || text === "x-razorpay-signature") {
+          const provider = text.includes("stripe") ? "stripe" : text.includes("hub") ? "github" : text.includes("razorpay") ? "razorpay" : "custom";
+          const startLine = getLineFromPos(sourceFile, node.getStart());
+          const endLine = getLineFromPos(sourceFile, node.getEnd());
+          if (!symbols.some(s => s.name === `Webhook Signature: ${provider}` && s.line === startLine)) {
+            symbols.push({
+              name: `Webhook Signature: ${provider}`,
+              kind: "webhook",
+              line: startLine,
+              startLine,
+              endLine
+            });
+          }
+        }
       }
     }
 
@@ -353,6 +430,21 @@ export function parseFile(language: string, relativePath: string, absolutePath: 
         continue;
       }
 
+      // WebSockets and Webhooks in Python
+      const pyWsMatch = lineText.match(/@(?:sio|socketio)\.on\(['"]([^'"]+)['"]/);
+      if (pyWsMatch) {
+        const eventName = pyWsMatch[1];
+        const range = getPythonBlockRange(i, indent);
+        symbols.push({ name: `WebSocket Listen: ${eventName}`, kind: "event", line: i + 1, startLine: i + 1, endLine: range.endLine });
+        continue;
+      }
+
+      const pyWebhookMatch = lineText.match(/Webhook\.construct_event\(/);
+      if (pyWebhookMatch) {
+        symbols.push({ name: "Webhook: stripe", kind: "webhook", line: i + 1, startLine: i + 1, endLine: i + 1 });
+        continue;
+      }
+
       // FastAPI / Flask Routes
       const routeMatch = lineText.match(/@(?:app|router)\.(get|post|put|delete)\(['"]([^'"]+)['"]/);
       if (routeMatch) {
@@ -384,6 +476,18 @@ export function parseFile(language: string, relativePath: string, absolutePath: 
   } else if (language === "Java") {
     for (let i = 0; i < lines.length; i++) {
       const lineText = lines[i];
+
+      // WebSockets and Webhooks in Java
+      const javaWsMatch = lineText.match(/@OnMessage|@OnOpen|@OnClose/);
+      if (javaWsMatch) {
+        symbols.push({ name: `WebSocket Event: ${javaWsMatch[0]}`, kind: "event", line: i + 1, startLine: i + 1, endLine: i + 1 });
+        continue;
+      }
+      const javaWebhookMatch = lineText.match(/Webhook\.constructEvent\(/);
+      if (javaWebhookMatch) {
+        symbols.push({ name: "Webhook: stripe", kind: "webhook", line: i + 1, startLine: i + 1, endLine: i + 1 });
+        continue;
+      }
 
       // Routes (Spring boot annotations)
       const mappingMatch = lineText.match(/@(GetMapping|PostMapping|PutMapping|DeleteMapping)\s*\(\s*["']([^"']+)["']\s*\)/);
@@ -418,6 +522,13 @@ export function parseFile(language: string, relativePath: string, absolutePath: 
   } else if (language === "Go") {
     for (let i = 0; i < lines.length; i++) {
       const lineText = lines[i];
+
+      // WebSockets and Webhooks in Go
+      const goWebhookMatch = lineText.match(/Webhook\.ConstructEvent\(/);
+      if (goWebhookMatch) {
+        symbols.push({ name: "Webhook: stripe", kind: "webhook", line: i + 1, startLine: i + 1, endLine: i + 1 });
+        continue;
+      }
 
       // Route
       const handlerMatch = lineText.match(/(?:\.HandleFunc|\.Handle)\(['"]([^'"]+)['"],\s*([A-Za-z0-9_]+)/);
