@@ -219,6 +219,9 @@ importers:
       express:
         specifier: ^4.19.2
         version: 4.22.2
+      ioredis:
+        specifier: ^5.11.1
+        version: 5.11.1
     devDependencies:
       '@types/archiver':
         specifier: ^6.0.2

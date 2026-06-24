@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "test": "tsx src/tests/webhook.test.ts"
   },
   "dependencies": {
     "@opspilot/database": "workspace:*",
@@ -14,7 +15,8 @@
     "@opspilot/schemas": "workspace:*",
     "@opspilot/connector-github": "workspace:*",
     "express": "^4.19.2",
-    "archiver": "^7.0.1"
+    "archiver": "^7.0.1",
+    "ioredis": "^5.11.1"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
