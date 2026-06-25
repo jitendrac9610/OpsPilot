@@ -155,12 +155,76 @@ async function runApiTests() {
   assert.ok(jwtToken);
   console.log("✓ Login with new password succeeds.");
 
+  // F1. Test Refresh Token Rotation and Reuse Detection
+  console.log("\nTesting Refresh Token Rotation...");
+  const loginRefreshToken = loginData.refreshToken;
+  assert.ok(loginRefreshToken);
+
+  // Refresh token rotation POST /api/auth/refresh
+  const refreshRes = await fetch(`${baseUrl}/api/auth/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refreshToken: loginRefreshToken })
+  });
+  assert.strictEqual(refreshRes.status, 200);
+  const refreshData = await refreshRes.json() as any;
+  const newAccessToken = refreshData.token;
+  const newRefreshToken = refreshData.refreshToken;
+  assert.ok(newAccessToken);
+  assert.ok(newRefreshToken);
+  assert.notStrictEqual(newAccessToken, jwtToken);
+  assert.notStrictEqual(newRefreshToken, loginRefreshToken);
+  console.log("✓ Refresh token rotation returns new access token and rotated refresh token.");
+
+  // Verify access with new token
+  const testAccessRes = await fetch(`${baseUrl}/api/auth/2fa/setup`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${newAccessToken}`
+    }
+  });
+  assert.strictEqual(testAccessRes.status, 200);
+  console.log("✓ Access succeeds using the new access token.");
+
+  // Test Refresh Token Reuse Detection (Token Theft Defense)
+  console.log("Testing Refresh Token reuse detection...");
+  const reuseRes = await fetch(`${baseUrl}/api/auth/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refreshToken: loginRefreshToken }) // reuse old rotated token
+  });
+  assert.strictEqual(reuseRes.status, 401);
+  const reuseData = await reuseRes.json() as any;
+  assert.ok(reuseData.message.includes("reuse detected") || reuseData.message.includes("Security Alert"));
+  console.log("✓ Reuse detection triggers 401 Unauthorized.");
+
+  // Verify that the new access token is now invalid because reuse detection revoked all sessions
+  const testAccessAfterReuseRes = await fetch(`${baseUrl}/api/auth/2fa/setup`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${newAccessToken}`
+    }
+  });
+  assert.strictEqual(testAccessAfterReuseRes.status, 401);
+  console.log("✓ Active sessions are revoked on refresh token reuse.");
+
+  // Login again to get a fresh token for logout test
+  const loginForLogoutRes = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password: newPassword })
+  });
+  const loginForLogoutData = await loginForLogoutRes.json() as any;
+  const jwtTokenForLogout = loginForLogoutData.token;
+
   // G. Invalidate old sessions/cookies - verify logout
   const logoutRes = await fetch(`${baseUrl}/api/auth/logout`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${jwtToken}`
+      "Authorization": `Bearer ${jwtTokenForLogout}`
     }
   });
   assert.strictEqual(logoutRes.status, 200);
@@ -173,7 +237,7 @@ async function runApiTests() {
     body: JSON.stringify({ email, password: newPassword })
   });
   const reloginData = await reloginRes.json() as any;
-  const loginToken = reloginData.token;
+  let loginToken = reloginData.token;
 
   // H. Setup 2FA
   const setupRes = await fetch(`${baseUrl}/api/auth/2fa/setup`, {
@@ -248,6 +312,7 @@ async function runApiTests() {
   assert.strictEqual(verifyRecoveryRes.status, 200);
   const verifyRecoveryData = await verifyRecoveryRes.json() as any;
   assert.ok(verifyRecoveryData.token);
+  loginToken = verifyRecoveryData.token;
   console.log("✓ Verifying valid 2FA recovery code completes login and issues token.");
 
   // 6. Test Diagnostic Runs Integration Pipeline

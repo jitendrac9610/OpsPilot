@@ -1,3 +1,16 @@
+import dotenv from "dotenv";
+import path from "node:path";
+import fs from "node:fs";
+
+// Load environment variables before database prisma import
+const rootEnv = path.resolve(process.cwd(), ".env");
+const parentEnv = path.resolve(process.cwd(), "../../.env");
+if (fs.existsSync(rootEnv)) {
+  dotenv.config({ path: rootEnv });
+} else if (fs.existsSync(parentEnv)) {
+  dotenv.config({ path: parentEnv });
+}
+
 import express, { Request, Response, NextFunction } from "express";
 import { Queue } from "bullmq";
 import { logger, config, OpsPilotError, EventBus, generateId, generateCorrelationId, generateIdempotencyKey } from "@opspilot/shared";
@@ -8,8 +21,14 @@ app.use(express.json());
 
 const QUEUE_NAME = "agent-runs";
 
-// Helper to enqueue agent investigation
-async function triggerAgentInvestigation(incidentId: string, title: string) {
+// Helper to enqueue agent investigation against the exact code version
+async function triggerAgentInvestigation(
+  incidentId: string,
+  title: string,
+  serviceId?: string,
+  environment = "production",
+  timestamp = new Date()
+) {
   try {
     const redisUrl = new URL(config.redisUrl);
     const connection = {
@@ -22,20 +41,89 @@ async function triggerAgentInvestigation(incidentId: string, title: string) {
 
     const agentQueue = new Queue(QUEUE_NAME, { connection });
     
-    // We fetch a default snapshotId to link the agent run to code, if it exists
-    const latestSnapshot = await prisma.repositorySnapshot.findFirst({
-      orderBy: { createdAt: "desc" }
-    });
+    let snapshotId = "mock-snapshot-id";
+    let commitSha = "latest";
+    let repositoryId = "mock-repository-id";
+
+    if (serviceId) {
+      const service = await prisma.service.findUnique({
+        where: { id: serviceId }
+      });
+      if (service) {
+        const workspace = await prisma.repositoryWorkspace.findUnique({
+          where: { id: service.workspaceId }
+        });
+        if (workspace) {
+          repositoryId = workspace.repositoryId;
+          
+          // Find deployment active at the telemetry timestamp
+          const deployment = await prisma.deploymentEvent.findFirst({
+            where: {
+              repositoryId,
+              environment,
+              createdAt: { lte: timestamp }
+            },
+            orderBy: { createdAt: "desc" }
+          }) || await prisma.deploymentEvent.findFirst({
+            // Fallback to the latest deployment overall if none before timestamp
+            where: { repositoryId, environment },
+            orderBy: { createdAt: "desc" }
+          });
+
+          if (deployment) {
+            commitSha = deployment.commitSha;
+            
+            // Find corresponding snapshot
+            const snapshot = await prisma.repositorySnapshot.findFirst({
+              where: { repositoryId, commitSha }
+            });
+            if (snapshot) {
+              snapshotId = snapshot.id;
+            } else {
+              logger.warn({ repositoryId, commitSha }, "Deployment commit snapshot not found. Falling back to latest snapshot.");
+              const latestSnap = await prisma.repositorySnapshot.findFirst({
+                where: { repositoryId },
+                orderBy: { createdAt: "desc" }
+              });
+              if (latestSnap) {
+                snapshotId = latestSnap.id;
+              }
+            }
+          } else {
+            logger.warn({ repositoryId, environment }, "No deployment event found. Falling back to latest snapshot.");
+            const latestSnap = await prisma.repositorySnapshot.findFirst({
+              where: { repositoryId },
+              orderBy: { createdAt: "desc" }
+            });
+            if (latestSnap) {
+              snapshotId = latestSnap.id;
+            }
+          }
+        }
+      }
+    }
+
+    if (snapshotId === "mock-snapshot-id") {
+      // Fallback: fetch a default snapshotId to link the agent run to code, if it exists
+      const latestSnapshot = await prisma.repositorySnapshot.findFirst({
+        orderBy: { createdAt: "desc" }
+      });
+      if (latestSnapshot) {
+        snapshotId = latestSnapshot.id;
+        repositoryId = latestSnapshot.repositoryId;
+        commitSha = latestSnapshot.commitSha;
+      }
+    }
 
     const job = await agentQueue.add("investigate-incident", {
       agentRunId: `run_${generateId()}`,
       incidentId,
-      snapshotId: latestSnapshot?.id || "mock-snapshot-id",
+      snapshotId,
       goal: `Investigate and remediate the production incident: ${title}`,
       isProduction: true
     });
 
-    logger.info({ jobId: job.id, incidentId }, "Enqueued AI Agent investigation job on BullMQ queue");
+    logger.info({ jobId: job.id, incidentId, snapshotId, commitSha, environment, serviceId }, "Enqueued AI Agent investigation job on BullMQ queue");
   } catch (err: any) {
     logger.warn({ err: err.message, incidentId }, "Redis/BullMQ not available. Incident Worker skipping agent job enqueuing.");
   }
@@ -115,6 +203,31 @@ app.post("/evaluate", async (req: Request, res: Response, next: NextFunction) =>
               });
             }
 
+            // Resolve commitSha before publishing and enqueuing
+            let resolvedCommitSha = "latest";
+            if (metric.serviceId) {
+              const service = await prisma.service.findUnique({ where: { id: metric.serviceId } });
+              if (service) {
+                const workspace = await prisma.repositoryWorkspace.findUnique({ where: { id: service.workspaceId } });
+                if (workspace) {
+                  const deployment = await prisma.deploymentEvent.findFirst({
+                    where: {
+                      repositoryId: workspace.repositoryId,
+                      environment: "production",
+                      createdAt: { lte: new Date(metric.timestamp) }
+                    },
+                    orderBy: { createdAt: "desc" }
+                  }) || await prisma.deploymentEvent.findFirst({
+                    where: { repositoryId: workspace.repositoryId, environment: "production" },
+                    orderBy: { createdAt: "desc" }
+                  });
+                  if (deployment) {
+                    resolvedCommitSha = deployment.commitSha;
+                  }
+                }
+              }
+            }
+
             // Publish event bus notification
             await EventBus.publish({
               id: generateId("evt"),
@@ -123,14 +236,14 @@ app.post("/evaluate", async (req: Request, res: Response, next: NextFunction) =>
               projectId: "system",
               environment: "production",
               sourceEntity: "incident-worker",
-              commitSha: "latest",
+              commitSha: resolvedCommitSha,
               correlationId: generateCorrelationId(),
               idempotencyKey: generateIdempotencyKey(),
               timestamp: new Date().toISOString(),
               data: { incidentId: incident.id, title: incident.title }
             });
 
-            logger.info({ incidentId: incident.id }, "Created new Incident and logged alert breach timeline event");
+            logger.info({ incidentId: incident.id, resolvedCommitSha }, "Created new Incident and logged alert breach timeline event");
 
             // Auto-trigger agent investigation
             await prisma.incident.update({
@@ -146,7 +259,7 @@ app.post("/evaluate", async (req: Request, res: Response, next: NextFunction) =>
               }
             });
 
-            await triggerAgentInvestigation(incident.id, incident.title);
+            await triggerAgentInvestigation(incident.id, incident.title, metric.serviceId, "production", new Date(metric.timestamp));
             createdIncidents.push(incident);
           }
         }

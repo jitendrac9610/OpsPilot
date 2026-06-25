@@ -21,6 +21,12 @@ export class WorkflowReplayer {
     logs: string[];
     variables: Record<string, unknown>;
     correlationId: string;
+    stepResults: Array<{
+      type: string;
+      success: boolean;
+      status?: number;
+      body?: unknown;
+    }>;
   }> {
     if (!this.driversInstance) {
       const { WorkflowDrivers } = await import("@opspilot/workflow-engine");
@@ -31,6 +37,7 @@ export class WorkflowReplayer {
     const logs: string[] = [];
     const variables = { ...(options.initialVariables || {}) };
     const correlationId = options.correlationId || crypto.randomUUID();
+    const stepResults: Array<{ type: string; success: boolean; status?: number; body?: unknown }> = [];
     let success = true;
 
     for (const step of workflowSteps) {
@@ -40,20 +47,35 @@ export class WorkflowReplayer {
       if (type === "HTTP" || type === "HTTP_REQUEST" || type === "CREATE_USER" || type === "AUTHENTICATE") {
         const repetitions = Math.max(1, Number(config.repetitions || 1));
         let latestBody: unknown;
+        let lastStatus: number | undefined;
+        let stepSuccess = true;
         for (let attempt = 0; attempt < repetitions; attempt += 1) {
           const res = await this.driversInstance.executeHTTPStep(config as any);
           latestBody = res.body;
+          lastStatus = res.status;
           logs.push(res.log);
           if (!res.success) {
+            stepSuccess = false;
             success = false;
             break;
           }
         }
+        stepResults.push({
+          type,
+          success: stepSuccess,
+          status: lastStatus,
+          body: latestBody
+        });
         if (!success) break;
         extractVariables(config.extractVariables, latestBody, variables);
       } else if (type === "BROWSER" || type === "BROWSER_ACTION") {
         const res = await this.driversInstance.executeBrowserStep(config as any);
         logs.push(res.log);
+        stepResults.push({
+          type,
+          success: res.success,
+          body: res.body
+        });
         if (!res.success) {
           success = false;
           break;
@@ -61,6 +83,10 @@ export class WorkflowReplayer {
       } else if (type === "WEBSOCKET_OPEN") {
         const res = await this.driversInstance.executeWebSocketStep(config as any);
         logs.push(res.log);
+        stepResults.push({
+          type,
+          success: res.success
+        });
         if (!res.success) {
           success = false;
           break;
@@ -68,6 +94,11 @@ export class WorkflowReplayer {
       } else if (type === "SIMULATE_WEBHOOK") {
         const res = await this.driversInstance.executeWebhookStep(config as any);
         logs.push(res.log);
+        stepResults.push({
+          type,
+          success: res.success,
+          body: res.body
+        });
         if (!res.success) {
           success = false;
           break;
@@ -79,7 +110,8 @@ export class WorkflowReplayer {
       success,
       logs,
       variables,
-      correlationId
+      correlationId,
+      stepResults
     };
   }
 }

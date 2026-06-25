@@ -153,17 +153,46 @@ router.get("/:id/capabilities", async (req: AuthenticatedRequest, res: Response,
       where: { snapshotId: latestSnapshot.id }
     });
 
-    // Fallback: Default TS Stack profile
-    res.status(200).json(capProfile || {
-      snapshotId: latestSnapshot.id,
-      profile: {
-        languages: ["TypeScript", "JavaScript"],
-        frameworks: ["Express", "Next.js"],
-        databases: ["PostgreSQL", "MongoDB"],
-        messaging: ["Inngest", "Redis"],
-        integrations: ["Clerk", "Stripe", "GetStream"]
+    if (capProfile) {
+      res.status(200).json({
+        id: capProfile.id,
+        snapshotId: capProfile.snapshotId,
+        source: "discovered",
+        status: "DISCOVERED",
+        profile: capProfile.profile,
+        createdAt: capProfile.createdAt
+      });
+    } else {
+      const isDemoMode = config.opspilotMode === "demo" || process.env.OPSPILOT_MODE === "demo";
+      if (isDemoMode) {
+        res.status(200).json({
+          snapshotId: latestSnapshot.id,
+          source: "simulated",
+          status: "DEMO",
+          profile: {
+            languages: ["TypeScript", "JavaScript"],
+            frameworks: ["Express", "Next.js"],
+            databases: ["PostgreSQL", "MongoDB"],
+            messaging: ["Inngest", "Redis"],
+            integrations: ["Clerk", "Stripe", "GetStream"]
+          }
+        });
+      } else {
+        res.status(200).json({
+          snapshotId: latestSnapshot.id,
+          source: "unavailable",
+          status: "NOT_DISCOVERED",
+          reason: "Capability discovery has not completed or failed for this repository snapshot.",
+          profile: {
+            languages: [],
+            frameworks: [],
+            databases: [],
+            messaging: [],
+            integrations: []
+          }
+        });
       }
-    });
+    }
   } catch (err) {
     next(err);
   }

@@ -82,7 +82,14 @@ export default function Dashboard() {
   const [fileContent, setFileContent] = useState<string | null>(null);
   const [loadingFileContent, setLoadingFileContent] = useState<boolean>(false);
   
-  const [mainView, setMainView] = useState<"quick-scan" | "projects" | "incidents" | "evaluation" | "billing" | "runtime-lab">("quick-scan");
+  const [mainView, setMainView] = useState<"quick-scan" | "projects" | "incidents" | "evaluation" | "billing" | "runtime-lab" | "diagnostic-runs">("quick-scan");
+
+  // Diagnostic Runs States
+  const [diagnosticRuns, setDiagnosticRuns] = useState<any[]>([]);
+  const [selectedRun, setSelectedRun] = useState<any | null>(null);
+  const [loadingRuns, setLoadingRuns] = useState<boolean>(false);
+  const [pollingRunId, setPollingRunId] = useState<string | null>(null);
+
 
   // Quick Scan States
   const [scanUrl, setScanUrl] = useState("");
@@ -330,6 +337,95 @@ export default function Dashboard() {
       setRunningLoadTest(false);
     }
   };
+
+  const fetchDiagnosticRuns = async () => {
+    setLoadingRuns(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/diagnostic-runs`, {
+        headers: {
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
+        }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDiagnosticRuns(data);
+      }
+    } catch (err) {
+      console.error("Failed to fetch diagnostic runs:", err);
+    } finally {
+      setLoadingRuns(false);
+    }
+  };
+
+  const fetchDiagnosticRunDetails = async (runId: string) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/diagnostic-runs/${runId}`, {
+        headers: {
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
+        }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSelectedRun(data);
+        if (data.status === "PENDING" || data.status === "RUNNING") {
+          setPollingRunId(runId);
+        } else {
+          setPollingRunId(null);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to fetch diagnostic run details:", err);
+    }
+  };
+
+  const handleCancelRun = async (runId: string) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/diagnostic-runs/${runId}/cancel`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
+        }
+      });
+      if (res.ok) {
+        await fetchDiagnosticRunDetails(runId);
+        await fetchDiagnosticRuns();
+      }
+    } catch (err) {
+      console.error("Failed to cancel run:", err);
+    }
+  };
+
+  const handleRetryRun = async (runId: string) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/diagnostic-runs/${runId}/retry`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token || localStorage.getItem("opspilot_token")}`,
+          "x-organization-id": activeOrg?.id || ""
+        }
+      });
+      if (res.ok) {
+        const newRun = await res.json();
+        setSelectedRun(newRun);
+        setPollingRunId(newRun.id);
+        await fetchDiagnosticRuns();
+      }
+    } catch (err) {
+      console.error("Failed to retry run:", err);
+    }
+  };
+
+  useEffect(() => {
+    if (!pollingRunId) return;
+    const interval = setInterval(() => {
+      fetchDiagnosticRunDetails(pollingRunId);
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [pollingRunId]);
+
 
   const fetchOrgs = async (authToken: string) => {
     try {
@@ -2267,6 +2363,503 @@ export default function Dashboard() {
     );
   };
 
+  const renderDiagnosticRunsView = () => {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: "28px" }}>
+        
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <h3 style={{ fontSize: "28px", fontFamily: "Space Grotesk" }}>Diagnostic Run Explorer</h3>
+            <p style={{ color: "var(--text-secondary)", fontSize: "14px", marginTop: "4px" }}>
+              Track repository-to-remediation verification pipeline runs in real-time
+            </p>
+          </div>
+          <button 
+            onClick={() => fetchDiagnosticRuns()} 
+            disabled={loadingRuns}
+            className="btn-secondary" 
+            style={{ padding: "8px 16px", display: "flex", alignItems: "center", gap: "8px" }}
+          >
+            <RefreshCw size={14} className={loadingRuns ? "spin" : ""} style={{ animation: loadingRuns ? "spin 2s linear infinite" : "none" }} />
+            Refresh Runs
+          </button>
+        </div>
+
+        {/* Split Grid */}
+        <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1.8fr", gap: "28px", alignItems: "start" }}>
+          
+          {/* Left Panel: Diagnostic Runs List */}
+          <div className="glass-card" style={{ padding: "20px", display: "flex", flexDirection: "column", gap: "16px", minHeight: "600px" }}>
+            <h4 style={{ fontSize: "18px", borderBottom: "1px solid var(--border-glass)", paddingBottom: "12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>Pipeline Runs</span>
+              <span style={{ fontSize: "12px", color: "var(--accent-cyan)", background: "rgba(0, 242, 254, 0.1)", padding: "2px 8px", borderRadius: "10px" }}>
+                {diagnosticRuns.length}
+              </span>
+            </h4>
+
+            {loadingRuns && diagnosticRuns.length === 0 ? (
+              <div className="flex-center" style={{ flex: 1, flexDirection: "column", gap: "12px" }}>
+                <RefreshCw size={24} className="spin" color="var(--accent-cyan)" style={{ animation: "spin 2s linear infinite" }} />
+                <span style={{ color: "var(--text-muted)", fontSize: "13px" }}>Loading runs...</span>
+              </div>
+            ) : diagnosticRuns.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "48px 0", color: "var(--text-muted)", fontSize: "14px", fontStyle: "italic" }}>
+                No diagnostic runs started yet. Click &apos;Run Automated Scan&apos; on the Quick Scan tab to begin.
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "12px", maxHeight: "550px", overflowY: "auto" }}>
+                {diagnosticRuns.map((run) => {
+                  const isSelected = selectedRun?.id === run.id;
+                  
+                  let statusColor = "var(--text-muted)";
+                  let statusBg = "rgba(255, 255, 255, 0.02)";
+                  if (run.status === "PENDING") {
+                    statusColor = "#e2e8f0";
+                    statusBg = "rgba(255,255,255,0.08)";
+                  } else if (run.status === "RUNNING") {
+                    statusColor = "var(--accent-purple)";
+                    statusBg = "rgba(155, 81, 224, 0.15)";
+                  } else if (run.status === "COMPLETED") {
+                    statusColor = "#00ff7f";
+                    statusBg = "rgba(0, 255, 127, 0.15)";
+                  } else if (run.status === "FAILED") {
+                    statusColor = "var(--accent-magenta)";
+                    statusBg = "rgba(244, 63, 94, 0.15)";
+                  } else if (run.status === "CANCELLED") {
+                    statusColor = "#ffa500";
+                    statusBg = "rgba(255, 165, 0, 0.15)";
+                  }
+
+                  return (
+                    <div
+                      key={run.id}
+                      onClick={() => fetchDiagnosticRunDetails(run.id)}
+                      style={{
+                        padding: "16px",
+                        borderRadius: "10px",
+                        background: isSelected ? "rgba(0, 242, 254, 0.06)" : "rgba(255, 255, 255, 0.01)",
+                        border: isSelected ? "1px solid var(--accent-cyan)" : "1px solid var(--border-glass)",
+                        boxShadow: isSelected ? "var(--shadow-neon-cyan)" : "none",
+                        cursor: "pointer",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "10px",
+                        transition: "var(--transition-smooth)"
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontSize: "13px", fontWeight: "700", color: "var(--text-primary)" }}>
+                          {run.repository?.name || "Repository"}
+                        </span>
+                        <span style={{ 
+                          fontSize: "11px", 
+                          color: statusColor, 
+                          background: statusBg, 
+                          border: `1px solid ${statusColor}33`,
+                          padding: "2px 8px", 
+                          borderRadius: "4px", 
+                          fontWeight: "600" 
+                        }}>
+                          {run.status}
+                        </span>
+                      </div>
+
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: "11px", color: "var(--text-muted)" }}>
+                        <span>Stage: <span style={{ color: "var(--text-secondary)" }}>{run.stage}</span></span>
+                      </div>
+
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "11px", color: "var(--text-muted)", marginTop: "4px" }}>
+                        <span>ID: {run.id.substring(0, 8)}</span>
+                        <span>{new Date(run.createdAt).toLocaleString()}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Right Panel: Selected Run Details & Timeline */}
+          <div className="glass-card" style={{ padding: "24px", display: "flex", flexDirection: "column", gap: "24px", minHeight: "600px" }}>
+            {!selectedRun ? (
+              <div className="flex-center" style={{ flex: 1, flexDirection: "column", gap: "16px", color: "var(--text-muted)", padding: "40px" }}>
+                <Activity size={48} color="var(--text-muted)" style={{ opacity: 0.5 }} />
+                <h4 style={{ fontSize: "18px", color: "var(--text-secondary)" }}>No Diagnostic Run Selected</h4>
+                <p style={{ textAlign: "center", fontSize: "13px", maxWidth: "300px" }}>
+                  Select a pipeline run from the list on the left to explore its execution timeline, contracts, assertions, and patch repairs.
+                </p>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+                
+                {/* Header Info */}
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", borderBottom: "1px solid var(--border-glass)", paddingBottom: "16px" }}>
+                  <div>
+                    <h4 style={{ fontSize: "20px", color: "var(--text-primary)" }}>
+                      Run on {selectedRun.repository?.name || "Repository"}
+                    </h4>
+                    <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "4px" }}>
+                      Run ID: <code style={{ color: "var(--accent-cyan)" }}>{selectedRun.id}</code> • Created At: {new Date(selectedRun.createdAt).toLocaleString()}
+                    </p>
+                  </div>
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    {selectedRun.status === "RUNNING" && (
+                      <button 
+                        onClick={() => handleCancelRun(selectedRun.id)}
+                        className="btn-secondary" 
+                        style={{ padding: "4px 10px", fontSize: "11px", display: "flex", alignItems: "center", gap: "4px" }}
+                      >
+                        Cancel Run
+                      </button>
+                    )}
+                    {(selectedRun.status === "FAILED" || selectedRun.status === "CANCELLED") && (
+                      <button 
+                        onClick={() => handleRetryRun(selectedRun.id)}
+                        className="btn-primary" 
+                        style={{ padding: "4px 10px", fontSize: "11px", display: "flex", alignItems: "center", gap: "4px" }}
+                      >
+                        <RefreshCw size={10} /> Retry Run
+                      </button>
+                    )}
+                    <span style={{
+                      fontSize: "11px",
+                      background: selectedRun.status === "COMPLETED" ? "rgba(0, 255, 127, 0.15)" : (selectedRun.status === "FAILED" ? "rgba(244, 63, 94, 0.15)" : "rgba(255, 165, 0, 0.15)"),
+                      color: selectedRun.status === "COMPLETED" ? "#00ff7f" : (selectedRun.status === "FAILED" ? "var(--accent-magenta)" : "#ffa500"),
+                      padding: "4px 10px",
+                      borderRadius: "6px",
+                      fontWeight: "700",
+                      border: `1px solid ${selectedRun.status === "COMPLETED" ? "#00ff7f" : (selectedRun.status === "FAILED" ? "var(--accent-magenta)" : "#ffa500")}33`
+                    }}>
+                      {selectedRun.status}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Progress Stages Timeline */}
+                <div style={{ display: "flex", flexDirection: "column", gap: "16px", background: "rgba(5, 8, 17, 0.3)", padding: "16px", borderRadius: "12px", border: "1px solid var(--border-glass)" }}>
+                  <h5 style={{ fontSize: "14px", fontWeight: "600", color: "var(--text-primary)" }}>Execution Stage Progress</h5>
+                  <div style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    position: "relative",
+                    marginTop: "8px",
+                    padding: "0 10px"
+                  }}>
+                    {/* Background line */}
+                    <div style={{
+                      position: "absolute",
+                      left: "30px",
+                      right: "30px",
+                      top: "12px",
+                      height: "2px",
+                      background: "rgba(255,255,255,0.08)",
+                      zIndex: 1
+                    }}></div>
+
+                    {[
+                      { key: "CLONING", label: "Clone" },
+                      { key: "DISCOVERING", label: "Discover" },
+                      { key: "INDEXING", label: "Index" },
+                      { key: "SANDBOX_PROVISION", label: "Provision" },
+                      { key: "SANDBOX_START", label: "Startup" },
+                      { key: "FINISHED", label: "Finished" }
+                    ].map((stg, idx) => {
+                      const stagesList = ["CLONING", "DISCOVERING", "INDEXING", "SANDBOX_PROVISION", "SANDBOX_START", "BOOTSTRAP_AUTH", "PLANNING_WORKFLOW", "EXECUTING_WORKFLOW", "LOCALIZING_FAILURE", "FINISHED"];
+                      const currentStageIdx = stagesList.indexOf(selectedRun.stage);
+                      const stepStageIdx = stagesList.indexOf(stg.key);
+                      
+                      let active = false;
+                      let done = false;
+                      if (selectedRun.status === "COMPLETED") {
+                        done = true;
+                      } else if (selectedRun.status === "FAILED" && currentStageIdx <= stepStageIdx) {
+                        // Keep failed stage marked
+                      } else {
+                        active = selectedRun.stage === stg.key;
+                        done = currentStageIdx > stepStageIdx;
+                      }
+
+                      let color = "rgba(255,255,255,0.15)";
+                      let bg = "rgba(255,255,255,0.05)";
+                      let shadow = "none";
+                      
+                      if (done) {
+                        color = "#00ff7f";
+                        bg = "rgba(0, 255, 127, 0.1)";
+                      } else if (active) {
+                        color = "var(--accent-cyan)";
+                        bg = "rgba(0, 242, 254, 0.1)";
+                        shadow = "0 0 10px var(--accent-cyan)";
+                      } else if (selectedRun.status === "FAILED" && selectedRun.stage === stg.key) {
+                        color = "var(--accent-magenta)";
+                        bg = "rgba(244, 63, 94, 0.1)";
+                        shadow = "0 0 10px var(--accent-magenta)";
+                      }
+
+                      return (
+                        <div key={stg.key} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "6px", zIndex: 2, width: "60px" }}>
+                          <div style={{
+                            width: "26px",
+                            height: "26px",
+                            borderRadius: "50%",
+                            background: "#050811",
+                            border: `2px solid ${color}`,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            fontSize: "11px",
+                            fontWeight: "bold",
+                            color: color,
+                            boxShadow: shadow
+                          }}>
+                            {done ? "✓" : idx + 1}
+                          </div>
+                          <span style={{ fontSize: "10px", color: active ? "var(--accent-cyan)" : "var(--text-muted)", fontWeight: active ? "bold" : "normal", textAlign: "center" }}>
+                            {stg.label}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Sub Tab selection inside details */}
+                <div style={{ display: "flex", gap: "12px", borderBottom: "1px solid var(--border-glass)", paddingBottom: "8px" }}>
+                  {["Timeline", "Discovered Stack", "Contracts & Workflows", "Telemetry & Logs", "Remediation & Hypotheses"].map((tab) => {
+                    const isActive = selectedTab === tab.toLowerCase().replace(/\s/g, "-");
+                    return (
+                      <button
+                        key={tab}
+                        onClick={() => setSelectedTab(tab.toLowerCase().replace(/\s/g, "-"))}
+                        style={{
+                          padding: "6px 12px",
+                          background: "transparent",
+                          border: "none",
+                          borderBottom: isActive ? "2px solid var(--accent-cyan)" : "2px solid transparent",
+                          color: isActive ? "var(--accent-cyan)" : "var(--text-secondary)",
+                          fontSize: "13px",
+                          fontWeight: "600",
+                          cursor: "pointer"
+                        }}
+                      >
+                        {tab}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Sub Tab contents */}
+                {selectedTab === "timeline" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    <h5 style={{ fontSize: "14px", fontWeight: "600", color: "var(--text-primary)" }}>Full Causal Timeline</h5>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "12px", paddingLeft: "12px", borderLeft: "2px solid var(--border-glass)" }}>
+                      <div style={{ position: "relative" }}>
+                        <div style={{ position: "absolute", left: "-21px", top: "4px", width: "16px", height: "16px", borderRadius: "50%", background: "#00ff7f", border: "2px solid #050811" }} />
+                        <div style={{ fontSize: "13px", fontWeight: "600", color: "var(--text-primary)" }}>1. Repository Cloned Successfully</div>
+                        <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "2px" }}>Fetched HEAD commit snapshot: <code style={{ color: "var(--accent-cyan)" }}>{selectedRun.snapshotId || "n/a"}</code></p>
+                      </div>
+                      
+                      {selectedRun.stage !== "CLONING" && (
+                        <div style={{ position: "relative", marginTop: "12px" }}>
+                          <div style={{ position: "absolute", left: "-21px", top: "4px", width: "16px", height: "16px", borderRadius: "50%", background: "#00ff7f", border: "2px solid #050811" }} />
+                          <div style={{ fontSize: "13px", fontWeight: "600", color: "var(--text-primary)" }}>2. Stack Discovery Completed</div>
+                          <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "2px" }}>Identified API servers, worker queues, and database engines.</p>
+                        </div>
+                      )}
+
+                      {["INDEXING", "SANDBOX_PROVISION", "SANDBOX_START", "BOOTSTRAP_AUTH", "PLANNING_WORKFLOW", "EXECUTING_WORKFLOW", "LOCALIZING_FAILURE", "FINISHED"].indexOf(selectedRun.stage) >= 0 && (
+                        <div style={{ position: "relative", marginTop: "12px" }}>
+                          <div style={{ position: "absolute", left: "-21px", top: "4px", width: "16px", height: "16px", borderRadius: "50%", background: "#00ff7f", border: "2px solid #050811" }} />
+                          <div style={{ fontSize: "13px", fontWeight: "600", color: "var(--text-primary)" }}>3. Codebase AST Indexing & Static Scan</div>
+                          <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "2px" }}>Created compiler symbol references graph.</p>
+                        </div>
+                      )}
+
+                      {["SANDBOX_PROVISION", "SANDBOX_START", "BOOTSTRAP_AUTH", "PLANNING_WORKFLOW", "EXECUTING_WORKFLOW", "LOCALIZING_FAILURE", "FINISHED"].indexOf(selectedRun.stage) >= 0 && (
+                        <div style={{ position: "relative", marginTop: "12px" }}>
+                          <div style={{ position: "absolute", left: "-21px", top: "4px", width: "16px", height: "16px", borderRadius: "50%", background: "#00ff7f", border: "2px solid #050811" }} />
+                          <div style={{ fontSize: "13px", fontWeight: "600", color: "var(--text-primary)" }}>4. Ephemeral Container Sandbox Built</div>
+                          <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "2px" }}>Provisioned PostgreSQL, Redis, and isolated application runner.</p>
+                        </div>
+                      )}
+
+                      {["FINISHED"].indexOf(selectedRun.stage) >= 0 && (
+                        <div style={{ position: "relative", marginTop: "12px" }}>
+                          <div style={{ position: "absolute", left: "-21px", top: "4px", width: "16px", height: "16px", borderRadius: "50%", background: selectedRun.status === "COMPLETED" ? "#00ff7f" : "var(--accent-magenta)", border: "2px solid #050811" }} />
+                          <div style={{ fontSize: "13px", fontWeight: "600", color: "var(--text-primary)" }}>5. Workflow Execution & Remediation Analysis</div>
+                          <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "2px" }}>
+                            {selectedRun.status === "COMPLETED" 
+                              ? "All verification checks passed. Fix applied and validated." 
+                              : `Pipeline failed during ${selectedRun.stage} execution.`}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {selectedTab === "discovered-stack" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    <h5 style={{ fontSize: "14px", fontWeight: "600", color: "var(--text-primary)" }}>Discovered Microservices & Dependencies</h5>
+                    
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+                      {selectedRun.discoveredServices ? (
+                        (() => {
+                          try {
+                            const svcs = typeof selectedRun.discoveredServices === "string" 
+                              ? JSON.parse(selectedRun.discoveredServices) 
+                              : selectedRun.discoveredServices;
+                            
+                            return svcs.map((s: any, idx: number) => (
+                              <div key={idx} style={{ padding: "12px", borderRadius: "8px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-glass)" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                                  <span style={{ fontWeight: "700" }}>{s.name || s.id}</span>
+                                  <span style={{ fontSize: "11px", color: "var(--accent-cyan)", background: "rgba(0, 242, 254, 0.08)", padding: "1px 6px", borderRadius: "4px" }}>
+                                    {s.kind || s.type || "service"}
+                                  </span>
+                                </div>
+                                <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "6px" }}>Port: {s.port || "Dynamic"}</p>
+                              </div>
+                            ));
+                          } catch {
+                            return <p style={{ color: "var(--text-muted)" }}>Failed to parse services data.</p>;
+                          }
+                        })()
+                      ) : (
+                        <p style={{ color: "var(--text-muted)", fontStyle: "italic", gridColumn: "span 2" }}>No services discovered in this stage yet.</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {selectedTab === "contracts-&-workflows" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px" }}>
+                      
+                      <div>
+                        <h5 style={{ fontSize: "14px", fontWeight: "600", color: "var(--text-primary)", marginBottom: "12px" }}>Discovered HTTP API Contracts</h5>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "10px", maxHeight: "300px", overflowY: "auto" }}>
+                          {selectedRun.contracts ? (
+                            (() => {
+                              try {
+                                const contracts = typeof selectedRun.contracts === "string" 
+                                  ? JSON.parse(selectedRun.contracts) 
+                                  : selectedRun.contracts;
+                                
+                                return contracts.map((c: any, idx: number) => (
+                                  <div key={idx} style={{ padding: "10px", borderRadius: "6px", background: "rgba(255,255,255,0.01)", border: "1px solid var(--border-glass)", fontFamily: "monospace", fontSize: "12px" }}>
+                                    <span style={{ color: c.method === "GET" ? "#00ff7f" : "var(--accent-cyan)", fontWeight: "bold", marginRight: "8px" }}>{c.method}</span>
+                                    <span style={{ color: "var(--text-primary)" }}>{c.path}</span>
+                                  </div>
+                                ));
+                              } catch {
+                                return <p style={{ color: "var(--text-muted)" }}>Failed to parse contracts data.</p>;
+                              }
+                            })()
+                          ) : (
+                            <p style={{ color: "var(--text-muted)", fontStyle: "italic" }}>No contracts discovered yet.</p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div>
+                        <h5 style={{ fontSize: "14px", fontWeight: "600", color: "var(--text-primary)", marginBottom: "12px" }}>Generated Business Workflows</h5>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "10px", maxHeight: "300px", overflowY: "auto" }}>
+                          {selectedRun.workflows ? (
+                            (() => {
+                              try {
+                                const wfs = typeof selectedRun.workflows === "string" 
+                                  ? JSON.parse(selectedRun.workflows) 
+                                  : selectedRun.workflows;
+                                
+                                return wfs.map((w: any, idx: number) => (
+                                  <div key={idx} style={{ padding: "10px", borderRadius: "6px", background: "rgba(255,255,255,0.01)", border: "1px solid var(--border-glass)", fontSize: "13px" }}>
+                                    <span style={{ fontWeight: "600", color: "var(--text-secondary)" }}>{w.name || `Workflow ${idx + 1}`}</span>
+                                    <p style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "4px" }}>Steps count: {w.steps?.length || 0}</p>
+                                  </div>
+                                ));
+                              } catch {
+                                return <p style={{ color: "var(--text-muted)" }}>Failed to parse workflows data.</p>;
+                              }
+                            })()
+                          ) : (
+                            <p style={{ color: "var(--text-muted)", fontStyle: "italic" }}>No stateful workflows planned yet.</p>
+                          )}
+                        </div>
+                      </div>
+
+                    </div>
+                  </div>
+                )}
+
+                {selectedTab === "telemetry-&-logs" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    <h5 style={{ fontSize: "14px", fontWeight: "600", color: "var(--text-primary)" }}>Executed Run Test Logs & Evidence</h5>
+                    <pre style={{
+                      background: "#02040a",
+                      border: "1px solid var(--border-glass)",
+                      borderRadius: "8px",
+                      padding: "16px",
+                      fontFamily: "Space Mono, monospace",
+                      fontSize: "12px",
+                      color: "#a9b1d6",
+                      maxHeight: "350px",
+                      overflowY: "auto",
+                      whiteSpace: "pre-wrap",
+                      margin: 0
+                    }}>
+                      {selectedRun.executedSteps 
+                        ? (typeof selectedRun.executedSteps === "string" ? selectedRun.executedSteps : JSON.stringify(selectedRun.executedSteps, null, 2))
+                        : "No logs or test executions recorded yet."}
+                    </pre>
+                  </div>
+                )}
+
+                {selectedTab === "remediation-&-hypotheses" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+                    
+                    <div>
+                      <h5 style={{ fontSize: "14px", fontWeight: "600", color: "var(--text-primary)", marginBottom: "12px" }}>AI Localization Hypotheses</h5>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                        {selectedRun.rootCause ? (
+                          <div style={{ padding: "16px", borderRadius: "8px", background: "rgba(155, 81, 224, 0.04)", border: "1px solid rgba(155, 81, 224, 0.2)" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px", color: "var(--accent-purple)", fontWeight: "bold", fontSize: "13px" }}>
+                              <Cpu size={14} /> Confirmed Root Cause Root Node
+                            </div>
+                            <p style={{ fontSize: "13px", color: "var(--text-primary)", marginTop: "8px" }}>
+                              {selectedRun.rootCause}
+                            </p>
+                          </div>
+                        ) : (
+                          <div style={{ color: "var(--text-muted)", fontStyle: "italic", fontSize: "13px" }}>
+                            No causal hypothesis or root cause confirmed yet. Run has not completed the localization phase.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {selectedRun.remediationStatus && (
+                      <div style={{ borderTop: "1px solid var(--border-glass)", paddingTop: "16px" }}>
+                        <h5 style={{ fontSize: "14px", fontWeight: "600", color: "var(--text-primary)", marginBottom: "12px" }}>Remediation Status</h5>
+                        <div style={{ padding: "16px", borderRadius: "8px", background: "rgba(0, 255, 127, 0.04)", border: "1px solid rgba(0, 255, 127, 0.2)" }}>
+                          <span style={{ fontWeight: "700", color: "#00ff7f" }}>PR Remediation status: {selectedRun.remediationStatus}</span>
+                        </div>
+                      </div>
+                    )}
+
+                  </div>
+                )}
+
+              </div>
+            )}
+          </div>
+
+        </div>
+      </div>
+    );
+  };
+
   const renderEvaluationView = () => {
     // Determine the active metrics (default to first run or default metrics)
     const activeRun = evaluations[0] || {
@@ -2677,26 +3270,53 @@ export default function Dashboard() {
               <p style={{ fontSize: "13px", color: "var(--text-secondary)", marginBottom: "16px" }}>
                 {sandboxDetails.demoData
                   ? "Demo-only simulated injections are visibly labeled and do not affect a real process."
-                  : "Real failure injection is not available yet for this isolated runner."}
+                  : "Inject real-time container-level outages, database network latency, and process failures in the sandbox."}
               </p>
               <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
                 <button 
-                  onClick={() => handleInjectFailure("latency", "api-service")}
-                  disabled={injectingFailure || !sandboxDetails.demoData}
+                  onClick={() => handleInjectFailure("stop_redis", "redis")}
+                  disabled={injectingFailure}
                   className="btn-secondary"
                   style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", border: "1px solid rgba(255,165,0,0.3)" }}
                 >
-                  <span style={{ color: "#ffa500", fontWeight: "600" }}>Inject 2000ms Latency Delay</span>
+                  <span style={{ color: "#ffa500", fontWeight: "600" }}>Stop Redis Database</span>
+                  <Database size={14} color="#ffa500" />
+                </button>
+                <button 
+                  onClick={() => handleInjectFailure("delay_database", "postgres")}
+                  disabled={injectingFailure}
+                  className="btn-secondary"
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", border: "1px solid rgba(255,165,0,0.3)" }}
+                >
+                  <span style={{ color: "#ffa500", fontWeight: "600" }}>Inject 5s Query Latency</span>
                   <Activity size={14} color="#ffa500" />
                 </button>
                 <button 
-                  onClick={() => handleInjectFailure("crash", "api-service")}
-                  disabled={injectingFailure || !sandboxDetails.demoData}
+                  onClick={() => handleInjectFailure("crash_worker", "worker")}
+                  disabled={injectingFailure}
                   className="btn-secondary"
                   style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", border: "1px solid rgba(244,63,94,0.3)" }}
                 >
-                  <span style={{ color: "var(--accent-magenta)", fontWeight: "600" }}>Crash API Service</span>
+                  <span style={{ color: "var(--accent-magenta)", fontWeight: "600" }}>Stop Queue Worker Process</span>
                   <AlertTriangle size={14} color="var(--accent-magenta)" />
+                </button>
+                <button 
+                  onClick={() => handleInjectFailure("api_timeout", "api")}
+                  disabled={injectingFailure}
+                  className="btn-secondary"
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", border: "1px solid rgba(244,63,94,0.3)" }}
+                >
+                  <span style={{ color: "var(--accent-magenta)", fontWeight: "600" }}>Inject API Timeout (Pause)</span>
+                  <Network size={14} color="var(--accent-magenta)" />
+                </button>
+                <button 
+                  onClick={() => handleInjectFailure("pod_termination", "api")}
+                  disabled={injectingFailure}
+                  className="btn-secondary"
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", border: "1px solid rgba(244,63,94,0.3)" }}
+                >
+                  <span style={{ color: "var(--accent-magenta)", fontWeight: "600" }}>Trigger Pod Termination (SIGTERM)</span>
+                  <ShieldAlert size={14} color="var(--accent-magenta)" />
                 </button>
               </div>
             </div>
@@ -2707,11 +3327,11 @@ export default function Dashboard() {
               <p style={{ fontSize: "13px", color: "var(--text-secondary)", marginBottom: "16px" }}>
                 {sandboxDetails.demoData
                   ? "Demo metrics are simulated and visibly labeled."
-                  : "A real HTTP load driver has not been configured for this sandbox."}
+                  : "Run a real HTTP load test against the active api service endpoint to evaluate performance."}
               </p>
               <button 
                 onClick={handleRunLoadTest}
-                disabled={runningLoadTest || !sandboxDetails.demoData}
+                disabled={runningLoadTest}
                 className="btn-primary"
                 style={{ width: "100%", padding: "12px", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}
               >
@@ -3096,6 +3716,25 @@ export default function Dashboard() {
                 <ShieldAlert size={16} /> Incidents
               </button>
               <button
+                onClick={() => { setMainView("diagnostic-runs"); fetchDiagnosticRuns(); }}
+                style={{
+                  padding: "8px 16px",
+                  background: "transparent",
+                  border: "none",
+                  borderBottom: mainView === "diagnostic-runs" ? "2px solid var(--accent-cyan)" : "2px solid transparent",
+                  color: mainView === "diagnostic-runs" ? "var(--accent-cyan)" : "var(--text-secondary)",
+                  fontWeight: "600",
+                  cursor: "pointer",
+                  fontSize: "14px",
+                  fontFamily: "Space Grotesk",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px"
+                }}
+              >
+                <Activity size={16} /> Diagnostic Runs
+              </button>
+              <button
                 onClick={() => { setMainView("evaluation"); fetchEvaluations(); }}
                 style={{
                   padding: "8px 16px",
@@ -3289,20 +3928,42 @@ export default function Dashboard() {
                                       )}
 
                                       {/* Discovered Stack Capabilities */}
-                                      {profile && (
-                                        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", borderTop: "1px dashed var(--border-glass)", paddingTop: "8px", marginTop: "8px" }}>
-                                          {profile.languages?.map((lang: string) => (
-                                            <span key={lang} style={{ fontSize: "10px", background: "rgba(0, 242, 254, 0.1)", color: "var(--accent-cyan)", padding: "2px 6px", borderRadius: "4px" }}>{lang}</span>
-                                          ))}
-                                          {profile.frameworks?.map((fw: string) => (
-                                            <span key={fw} style={{ fontSize: "10px", background: "rgba(186, 85, 211, 0.1)", color: "var(--accent-purple)", padding: "2px 6px", borderRadius: "4px" }}>{fw}</span>
-                                          ))}
-                                          {profile.databases?.map((db: string) => (
-                                            <span key={db} style={{ fontSize: "10px", background: "rgba(255, 99, 71, 0.1)", color: "#ff6347", padding: "2px 6px", borderRadius: "4px" }}>{db}</span>
-                                          ))}
-                                          {profile.integrations?.map((int: string) => (
-                                            <span key={int} style={{ fontSize: "10px", background: "rgba(255, 215, 0, 0.1)", color: "#ffd700", padding: "2px 6px", borderRadius: "4px" }}>{int}</span>
-                                          ))}
+                                      {cap.status && (
+                                        <div style={{ display: "flex", flexDirection: "column", gap: "6px", borderTop: "1px dashed var(--border-glass)", paddingTop: "8px", marginTop: "8px" }}>
+                                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "11px" }}>
+                                            <span style={{ color: "var(--text-muted)", fontWeight: "500" }}>Stack Capabilities:</span>
+                                            <span style={{
+                                              fontSize: "10px",
+                                              fontWeight: "bold",
+                                              color: cap.status === "DISCOVERED" ? "#00ff7f" : cap.source === "simulated" ? "#ffa500" : "#ff4d4d",
+                                              background: cap.status === "DISCOVERED" ? "rgba(0, 255, 127, 0.1)" : cap.source === "simulated" ? "rgba(255, 165, 0, 0.1)" : "rgba(255, 77, 77, 0.1)",
+                                              padding: "1px 6px",
+                                              borderRadius: "4px"
+                                            }}>
+                                              {cap.source === "simulated" ? "SIMULATED" : cap.status}
+                                            </span>
+                                          </div>
+                                          {cap.reason && (
+                                            <p style={{ color: "var(--text-muted)", fontSize: "11px", margin: "0", fontStyle: "italic" }}>
+                                              {cap.reason}
+                                            </p>
+                                          )}
+                                          {profile && (profile.languages?.length > 0 || profile.frameworks?.length > 0 || profile.databases?.length > 0 || profile.integrations?.length > 0) && (
+                                            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "4px" }}>
+                                              {profile.languages?.map((lang: string) => (
+                                                <span key={lang} style={{ fontSize: "10px", background: "rgba(0, 242, 254, 0.1)", color: "var(--accent-cyan)", padding: "2px 6px", borderRadius: "4px" }}>{lang}</span>
+                                              ))}
+                                              {profile.frameworks?.map((fw: string) => (
+                                                <span key={fw} style={{ fontSize: "10px", background: "rgba(186, 85, 211, 0.1)", color: "var(--accent-purple)", padding: "2px 6px", borderRadius: "4px" }}>{fw}</span>
+                                              ))}
+                                              {profile.databases?.map((db: string) => (
+                                                <span key={db} style={{ fontSize: "10px", background: "rgba(255, 99, 71, 0.1)", color: "#ff6347", padding: "2px 6px", borderRadius: "4px" }}>{db}</span>
+                                              ))}
+                                              {profile.integrations?.map((int: string) => (
+                                                <span key={int} style={{ fontSize: "10px", background: "rgba(255, 215, 0, 0.1)", color: "#ffd700", padding: "2px 6px", borderRadius: "4px" }}>{int}</span>
+                                              ))}
+                                            </div>
+                                          )}
                                         </div>
                                       )}
                                     </div>
@@ -3417,6 +4078,8 @@ export default function Dashboard() {
             </div>
             ) : mainView === "incidents" ? (
               renderIncidentsView()
+            ) : mainView === "diagnostic-runs" ? (
+              renderDiagnosticRunsView()
             ) : mainView === "evaluation" ? (
               renderEvaluationView()
             ) : mainView === "runtime-lab" ? (

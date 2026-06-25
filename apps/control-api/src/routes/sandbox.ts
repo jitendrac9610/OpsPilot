@@ -1,7 +1,8 @@
 import { Router, Response, NextFunction } from "express";
 import { prisma } from "@opspilot/database";
-import { config, ForbiddenError, OpsPilotError, ValidationError } from "@opspilot/shared";
+import { config, ForbiddenError, OpsPilotError, ValidationError, logger } from "@opspilot/shared";
 import { authMiddleware, AuthenticatedRequest } from "../middleware/auth.js";
+import { FailureInjector, LoadTestRunner } from "@opspilot/resilience-testing";
 
 const router = Router();
 router.use(authMiddleware);
@@ -228,27 +229,29 @@ router.delete("/:id", async (req: AuthenticatedRequest, res: Response, next: Nex
 router.post("/:id/inject-failure", async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   try {
     await requireOwnedSandbox(req, req.params.id);
-    if (!config.isDemoMode) {
-      throw new OpsPilotError(
-        "Real failure injection is not implemented for the isolated runner yet.",
-        "FAILURE_INJECTION_NOT_IMPLEMENTED",
-        501
-      );
+    const { type, serviceName, config: injectionConfig } = req.body;
+
+    if (config.isDemoMode) {
+      const injection = await prisma.failureInjection.create({
+        data: {
+          sandboxId: req.params.id,
+          type: type || "latency",
+          config: {
+            ...(injectionConfig || {}),
+            targetService: serviceName || "application",
+            simulated: true
+          }
+        }
+      });
+      return res.json({ ...injection, simulated: true, demoData: true });
     }
 
-    const { type, serviceName, config: injectionConfig } = req.body;
-    const injection = await prisma.failureInjection.create({
-      data: {
-        sandboxId: req.params.id,
-        type: type || "latency",
-        config: {
-          ...(injectionConfig || {}),
-          targetService: serviceName || "application",
-          simulated: true
-        }
-      }
+    const injector = new FailureInjector();
+    const result = await injector.injectFailure(req.params.id, type, injectionConfig);
+    const dbRecord = await prisma.failureInjection.findUnique({
+      where: { id: result.injectionId }
     });
-    res.json({ ...injection, simulated: true, demoData: true });
+    res.json({ ...dbRecord, simulated: false, demoData: false });
   } catch (error) {
     next(error);
   }
@@ -257,23 +260,46 @@ router.post("/:id/inject-failure", async (req: AuthenticatedRequest, res: Respon
 router.post("/:id/load-test", async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   try {
     await requireOwnedSandbox(req, req.params.id);
-    if (!config.isDemoMode) {
-      throw new OpsPilotError(
-        "A real HTTP load driver has not been configured for this sandbox.",
-        "LOAD_TEST_NOT_IMPLEMENTED",
-        501
-      );
+    const { targetUrl: reqTargetUrl, durationSeconds, requestsPerSecond } = req.body;
+
+    if (config.isDemoMode) {
+      const loadRun = await prisma.loadTestRun.create({
+        data: {
+          sandboxId: req.params.id,
+          throughput: 175,
+          latencyP95: 160,
+          errorRate: 0.01
+        }
+      });
+      return res.json({ ...loadRun, simulated: true, demoData: true });
     }
 
-    const loadRun = await prisma.loadTestRun.create({
-      data: {
-        sandboxId: req.params.id,
-        throughput: 175,
-        latencyP95: 160,
-        errorRate: 0.01
+    let targetUrl = reqTargetUrl;
+    if (!targetUrl) {
+      try {
+        const controllerServices = await controllerRequest(`/api/sandboxes/${req.params.id}/services`);
+        const apiService = controllerServices.services.find((s: any) => s.kind === "api");
+        targetUrl = apiService?.endpoints?.[0]?.externalUrl || `http://127.0.0.1:${apiService?.port || 4000}`;
+      } catch (err) {
+        logger.warn({ err }, "Could not resolve API service from controller, using default http://127.0.0.1:4000");
+        targetUrl = "http://127.0.0.1:4000";
       }
+    }
+
+    const runner = new LoadTestRunner();
+    const metrics = await runner.runLoadTest(
+      req.params.id,
+      targetUrl,
+      durationSeconds || 5,
+      requestsPerSecond || 20
+    );
+
+    const loadRun = await prisma.loadTestRun.findFirst({
+      where: { sandboxId: req.params.id },
+      orderBy: { createdAt: "desc" }
     });
-    res.json({ ...loadRun, simulated: true, demoData: true });
+
+    res.json({ ...loadRun, ...metrics, simulated: false, demoData: false });
   } catch (error) {
     next(error);
   }

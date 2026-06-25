@@ -109,7 +109,8 @@ async function runWebhookTests() {
       headers: {
         "Content-Type": "application/json",
         "x-github-event": "push",
-        "x-hub-signature-256": `sha256=${sig3}`
+        "x-hub-signature-256": `sha256=${sig3}`,
+        "x-github-delivery": "delivery-unique-3"
       },
       body: body3
     });
@@ -135,7 +136,8 @@ async function runWebhookTests() {
       headers: {
         "Content-Type": "application/json",
         "x-github-event": "installation",
-        "x-hub-signature-256": `sha256=${sig4}`
+        "x-hub-signature-256": `sha256=${sig4}`,
+        "x-github-delivery": "delivery-unique-4"
       },
       body: body4
     });
@@ -218,7 +220,8 @@ async function runWebhookTests() {
       headers: {
         "Content-Type": "application/json",
         "x-github-event": "installation_repositories",
-        "x-hub-signature-256": `sha256=${sig7}`
+        "x-hub-signature-256": `sha256=${sig7}`,
+        "x-github-delivery": "delivery-unique-7"
       },
       body: body7
     });
@@ -258,7 +261,8 @@ async function runWebhookTests() {
       headers: {
         "Content-Type": "application/json",
         "x-github-event": "installation_repositories",
-        "x-hub-signature-256": `sha256=${sig8}`
+        "x-hub-signature-256": `sha256=${sig8}`,
+        "x-github-delivery": "delivery-unique-8"
       },
       body: body8
     });
@@ -294,7 +298,8 @@ async function runWebhookTests() {
       headers: {
         "Content-Type": "application/json",
         "x-github-event": "installation",
-        "x-hub-signature-256": `sha256=${sig9}`
+        "x-hub-signature-256": `sha256=${sig9}`,
+        "x-github-delivery": "delivery-unique-9"
       },
       body: body9
     });
@@ -314,6 +319,155 @@ async function runWebhookTests() {
     });
     assert.ok(auditDeleted);
     console.log("✓ Processed installation.deleted successfully");
+
+    // 10. Missing X-GitHub-Delivery rejection
+    console.log("\n10. Testing missing X-GitHub-Delivery rejection...");
+    const payload10 = {
+      repository: { id: 999999, clone_url: "mock-repo-url" },
+      installation: { id: 123456 },
+      ref: "refs/heads/main",
+      head_commit: { id: "test-commit-sha-10" }
+    };
+    const body10 = JSON.stringify(payload10);
+    const sig10 = crypto.createHmac("sha256", "test-webhook-secret").update(body10).digest("hex");
+    const res10 = await fetch(`http://localhost:${PORT}/webhooks/github`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-github-event": "push",
+        "x-hub-signature-256": `sha256=${sig10}`
+        // no x-github-delivery
+      },
+      body: body10
+    });
+    assert.strictEqual(res10.status, 400);
+    const data10 = await res10.json() as any;
+    assert.strictEqual(data10.error, "BAD_REQUEST");
+    assert.ok(data10.message.includes("delivery"));
+    console.log("✓ Successfully rejected push due to missing X-GitHub-Delivery");
+
+    // 11. Branch deletion push event handling
+    console.log("\n11. Testing branch deletion push event handling...");
+    const payload11 = {
+      repository: { id: 999999 },
+      deleted: true,
+      ref: "refs/heads/feature-branch"
+    };
+    const body11 = JSON.stringify(payload11);
+    const sig11 = crypto.createHmac("sha256", "test-webhook-secret").update(body11).digest("hex");
+    const res11 = await fetch(`http://localhost:${PORT}/webhooks/github`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-github-event": "push",
+        "x-hub-signature-256": `sha256=${sig11}`,
+        "x-github-delivery": "delivery-unique-11"
+      },
+      body: body11
+    });
+    assert.strictEqual(res11.status, 200);
+    const data11 = await res11.json() as any;
+    assert.strictEqual(data11.status, "branch_deleted");
+    // Verify AuditLog
+    const auditBranchDeleted = await prisma.auditLog.findFirst({
+      where: { orgId: org.id, action: "github.branch.deleted" }
+    });
+    assert.ok(auditBranchDeleted);
+    assert.strictEqual((auditBranchDeleted.payload as any).branch, "feature-branch");
+    console.log("✓ Branch deletion handled and audited successfully");
+
+    // 12. Handle installation.suspend event
+    console.log("\n12. Testing installation.suspend lifecycle hook...");
+    // Let's first create the installation mapping again
+    await prisma.gitHubInstallation.create({
+      data: { repositoryId, installationId: "123456" }
+    });
+
+    const payload12 = {
+      action: "suspend",
+      installation: { id: 123456 }
+    };
+    const body12 = JSON.stringify(payload12);
+    const sig12 = crypto.createHmac("sha256", "test-webhook-secret").update(body12).digest("hex");
+    const res12 = await fetch(`http://localhost:${PORT}/webhooks/github`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-github-event": "installation",
+        "x-hub-signature-256": `sha256=${sig12}`,
+        "x-github-delivery": "delivery-unique-12"
+      },
+      body: body12
+    });
+    assert.strictEqual(res12.status, 200);
+    const data12 = await res12.json() as any;
+    assert.strictEqual(data12.status, "installation_suspended_processed");
+    // Verify DB removal
+    const suspendedRecord = await prisma.gitHubInstallation.findUnique({
+      where: { repositoryId }
+    });
+    assert.ok(!suspendedRecord);
+    // Verify AuditLog
+    const auditSuspended = await prisma.auditLog.findFirst({
+      where: { orgId: org.id, action: "github.installation.suspended" }
+    });
+    assert.ok(auditSuspended);
+    console.log("✓ Processed installation.suspend successfully");
+
+    // 13. Handle installation.unsuspend event
+    console.log("\n13. Testing installation.unsuspend lifecycle hook...");
+    const payload13 = {
+      action: "unsuspend",
+      installation: { id: 123456 },
+      repositories: [
+        { id: 999999, name: "webhook-test-repo" }
+      ]
+    };
+    const body13 = JSON.stringify(payload13);
+    const sig13 = crypto.createHmac("sha256", "test-webhook-secret").update(body13).digest("hex");
+    const res13 = await fetch(`http://localhost:${PORT}/webhooks/github`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-github-event": "installation",
+        "x-hub-signature-256": `sha256=${sig13}`,
+        "x-github-delivery": "delivery-unique-13"
+      },
+      body: body13
+    });
+    assert.strictEqual(res13.status, 200);
+    const data13 = await res13.json() as any;
+    assert.strictEqual(data13.status, "installation_unsuspended_processed");
+    // Verify DB restore
+    const unsuspendedRecord = await prisma.gitHubInstallation.findUnique({
+      where: { repositoryId }
+    });
+    assert.ok(unsuspendedRecord);
+    assert.strictEqual(unsuspendedRecord.installationId, "123456");
+    // Verify AuditLog
+    const auditUnsuspended = await prisma.auditLog.findFirst({
+      where: { orgId: org.id, action: "github.installation.unsuspended" }
+    });
+    assert.ok(auditUnsuspended);
+    console.log("✓ Processed installation.unsuspend successfully");
+
+    // 14. Signature-based replay attack prevention
+    console.log("\n14. Testing Signature-based replay protection...");
+    // Let's reuse payload13 and sig13 but with a different delivery ID to try and bypass deduplication
+    const res14 = await fetch(`http://localhost:${PORT}/webhooks/github`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-github-event": "installation",
+        "x-hub-signature-256": `sha256=${sig13}`,
+        "x-github-delivery": "delivery-unique-14" // New delivery ID
+      },
+      body: body13
+    });
+    assert.strictEqual(res14.status, 200);
+    const data14 = await res14.json() as any;
+    assert.strictEqual(data14.status, "ignored_replay");
+    console.log("✓ Successfully detected and blocked signature replay attack");
 
   } finally {
     // Cleanup Database
@@ -335,7 +489,10 @@ async function runWebhookTests() {
     });
 
     // Clean up Redis
-    await redis.del("github-webhook:delivery:delivery-unique-999");
+    const keys = await redis.keys("github-webhook:*");
+    for (const key of keys) {
+      await redis.del(key);
+    }
     
     // Stop server and redis
     testServer.close();

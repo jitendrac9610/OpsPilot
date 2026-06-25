@@ -72,15 +72,17 @@ router.post("/register", rateLimiter(5, 900, "register"), async (req: Request, r
         orgId: "system",
         userId: user.id,
         action: "user.register",
-        payload: { email: user.email }
+        payload: { email: user.email, ipAddress: req.ip, userAgent: req.headers["user-agent"] }
       }
     });
 
+    // generic responses: hide verificationToken in production environments
+    const isProduction = process.env.NODE_ENV === "production" || config.opspilotMode === "production";
     res.status(201).json({
       id: user.id,
       email: user.email,
       verified: user.verified,
-      verificationToken // Expose for testing/API client verification
+      ...(!isProduction ? { verificationToken } : {})
     });
   } catch (err) {
     next(err);
@@ -97,6 +99,14 @@ router.post("/login", rateLimiter(5, 900, "login"), async (req: Request, res: Re
 
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      // Audit log failed login
+      await prisma.auditLog.create({
+        data: {
+          orgId: "system",
+          action: "user.login-failed",
+          payload: { email, ipAddress: req.ip, userAgent: req.headers["user-agent"] }
+        }
+      });
       throw new UnauthorizedError("Invalid email or password");
     }
 
@@ -109,11 +119,6 @@ router.post("/login", rateLimiter(5, 900, "login"), async (req: Request, res: Re
         message: "Two-factor authentication code is required to complete login."
       });
     }
-
-    // Sign JWT token
-    const token = jwt.sign({ userId: user.id, email: user.email }, config.jwtSecret, {
-      expiresIn: "24h"
-    });
 
     // Session rotation: invalidate previous sessions
     await prisma.session.deleteMany({
@@ -132,7 +137,40 @@ router.post("/login", rateLimiter(5, 900, "login"), async (req: Request, res: Re
       }
     });
 
-    res.status(200).json({ token, user: { id: user.id, email: user.email } });
+    // Sign JWT token containing sessionId (expiry 15m)
+    const token = jwt.sign({ userId: user.id, email: user.email, sessionId: sessionToken }, config.jwtSecret, {
+      expiresIn: "15m"
+    });
+
+    // Generate refresh token (7 days expiry)
+    const refreshToken = crypto.randomBytes(40).toString("hex");
+    const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
+    await redis.set(`refresh-token:${refreshTokenHash}`, user.id, "EX", 7 * 24 * 60 * 60);
+    await redis.sadd(`user-refresh-tokens:${user.id}`, refreshTokenHash);
+
+    // Audit Log
+    await prisma.auditLog.create({
+      data: {
+        orgId: "system",
+        userId: user.id,
+        action: "user.login-success",
+        payload: { ipAddress: req.ip, userAgent: req.headers["user-agent"] }
+      }
+    });
+
+    // Set refresh token in secure HTTP-only cookie
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production" || config.opspilotMode === "production",
+      sameSite: "strict",
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    res.status(200).json({
+      token,
+      refreshToken, // Expose in body for compatibility and testing
+      user: { id: user.id, email: user.email }
+    });
   } catch (err) {
     next(err);
   }
@@ -143,10 +181,31 @@ router.post("/logout", authMiddleware, async (req: Request, res: Response, next:
   try {
     const authedReq = req as AuthenticatedRequest;
     if (authedReq.user) {
+      const userId = authedReq.user.id;
+      // Invalidate database sessions
       await prisma.session.deleteMany({
-        where: { userId: authedReq.user.id }
+        where: { userId }
+      });
+
+      // Invalidate refresh tokens
+      const tokenHashes = await redis.smembers(`user-refresh-tokens:${userId}`);
+      for (const h of tokenHashes) {
+        await redis.del(`refresh-token:${h}`);
+      }
+      await redis.del(`user-refresh-tokens:${userId}`);
+
+      // Audit Log
+      await prisma.auditLog.create({
+        data: {
+          orgId: "system",
+          userId,
+          action: "user.logout",
+          payload: { ipAddress: req.ip, userAgent: req.headers["user-agent"] }
+        }
       });
     }
+
+    res.clearCookie("refreshToken");
     res.status(200).json({ status: "logged_out" });
   } catch (err) {
     next(err);
@@ -174,6 +233,16 @@ router.post("/verify-email", rateLimiter(10, 900, "verify-email"), async (req: R
     // Invalidate token
     await redis.del(`verify-email:${tokenHash}`);
 
+    // Audit Log
+    await prisma.auditLog.create({
+      data: {
+        orgId: "system",
+        userId,
+        action: "user.email-verified",
+        payload: { ipAddress: req.ip, userAgent: req.headers["user-agent"] }
+      }
+    });
+
     res.status(200).json({ status: "verified" });
   } catch (err) {
     next(err);
@@ -189,10 +258,11 @@ router.post("/forgot-password", rateLimiter(3, 900, "forgot-password"), async (r
     const user = await prisma.user.findUnique({ where: { email } });
     
     // Always respond with a generic success response to avoid account enumeration
+    const isProduction = process.env.NODE_ENV === "production" || config.opspilotMode === "production";
     const respondSuccess = (token?: string) => res.status(200).json({
       status: "success",
       message: "If the email is registered, a password reset token has been generated.",
-      ...(token ? { resetToken: token } : {})
+      ...((token && !isProduction) ? { resetToken: token } : {})
     });
 
     if (!user) {
@@ -208,11 +278,11 @@ router.post("/forgot-password", rateLimiter(3, 900, "forgot-password"), async (r
         orgId: "system",
         userId: user.id,
         action: "user.password-reset-requested",
-        payload: { email: user.email }
+        payload: { email: user.email, ipAddress: req.ip, userAgent: req.headers["user-agent"] }
       }
     });
 
-    // Expose resetToken for validation and testing
+    // Expose resetToken only in non-production/test environments
     return respondSuccess(resetToken);
   } catch (err) {
     next(err);
@@ -246,7 +316,126 @@ router.post("/reset-password", rateLimiter(5, 900, "reset-password"), async (req
     // Invalidate the reset token after successful use
     await redis.del(`reset-password:${tokenHash}`);
 
+    // Audit Log
+    await prisma.auditLog.create({
+      data: {
+        orgId: "system",
+        userId,
+        action: "user.password-reset-completed",
+        payload: { ipAddress: req.ip, userAgent: req.headers["user-agent"] }
+      }
+    });
+
     res.status(200).json({ status: "password_reset_success" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/refresh
+router.post("/refresh", rateLimiter(10, 900, "refresh"), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const refreshToken = req.body?.refreshToken || req.cookies?.refreshToken;
+    if (!refreshToken) {
+      throw new ValidationError("Refresh token is required");
+    }
+
+    const oldTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
+    const userId = await redis.get(`refresh-token:${oldTokenHash}`);
+
+    // Refresh token reuse detection (token theft defense)
+    const isReused = await redis.sismember("used-refresh-tokens", oldTokenHash);
+    if (isReused) {
+      logger.warn({ oldTokenHash }, "Refresh token reuse detected! Revoking all user tokens and sessions.");
+      
+      const hijackedUserId = await redis.get(`used-refresh-token-owner:${oldTokenHash}`);
+      if (hijackedUserId) {
+        // Delete all active refresh tokens for the hijacked user
+        const tokenHashes = await redis.smembers(`user-refresh-tokens:${hijackedUserId}`);
+        for (const h of tokenHashes) {
+          await redis.del(`refresh-token:${h}`);
+        }
+        await redis.del(`user-refresh-tokens:${hijackedUserId}`);
+
+        // Revoke all database sessions for the hijacked user
+        await prisma.session.deleteMany({
+          where: { userId: hijackedUserId }
+        });
+
+        // Audit Log
+        await prisma.auditLog.create({
+          data: {
+            orgId: "system",
+            userId: hijackedUserId,
+            action: "user.refresh-token-reuse-attack",
+            payload: { ipAddress: req.ip, userAgent: req.headers["user-agent"] }
+          }
+        });
+      }
+      
+      res.clearCookie("refreshToken");
+      throw new UnauthorizedError("Security Alert: Token reuse detected. Please log in again.");
+    }
+
+    if (!userId) {
+      throw new UnauthorizedError("Invalid or expired refresh token");
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new UnauthorizedError("User no longer exists");
+    }
+
+    // Invalidate current DB sessions to execute rotation
+    await prisma.session.deleteMany({
+      where: { userId: user.id }
+    });
+
+    const newSessionToken = generateId("sess");
+    await prisma.session.create({
+      data: {
+        userId: user.id,
+        token: newSessionToken,
+        ipAddress: req.ip,
+        userAgent: req.headers["user-agent"],
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+      }
+    });
+
+    // Generate new short-lived access token
+    const newAccessToken = jwt.sign({ userId: user.id, email: user.email, sessionId: newSessionToken }, config.jwtSecret, {
+      expiresIn: "15m"
+    });
+
+    // Generate new rotated refresh token
+    const newRefreshToken = crypto.randomBytes(40).toString("hex");
+    const newHash = crypto.createHash("sha256").update(newRefreshToken).digest("hex");
+
+    // Remove old refresh token and track it as used for reuse detection (expire in 1h)
+    await redis.del(`refresh-token:${oldTokenHash}`);
+    await redis.srem(`user-refresh-tokens:${user.id}`, oldTokenHash);
+    
+    await redis.set(`used-refresh-token-owner:${oldTokenHash}`, user.id, "EX", 60 * 60);
+    await redis.sadd("used-refresh-tokens", oldTokenHash);
+    await redis.expire("used-refresh-tokens", 60 * 60);
+
+    // Save new refresh token in Redis
+    await redis.set(`refresh-token:${newHash}`, user.id, "EX", 7 * 24 * 60 * 60);
+    await redis.sadd(`user-refresh-tokens:${user.id}`, newHash);
+
+    // Set cookie
+    res.cookie("refreshToken", newRefreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production" || config.opspilotMode === "production",
+      sameSite: "strict",
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    res.status(200).json({
+      token: newAccessToken,
+      refreshToken: newRefreshToken,
+      user: { id: user.id, email: user.email }
+    });
   } catch (err) {
     next(err);
   }
@@ -300,7 +489,7 @@ router.post("/2fa/enable", authMiddleware, async (req: Request, res: Response, n
         orgId: "system",
         userId,
         action: "user.2fa-enabled",
-        payload: {}
+        payload: { ipAddress: req.ip, userAgent: req.headers["user-agent"] }
       }
     });
 
@@ -348,13 +537,17 @@ router.post("/2fa", rateLimiter(5, 900, "2fa"), async (req: Request, res: Respon
     }
 
     if (!verified) {
+      // Audit log failed 2FA
+      await prisma.auditLog.create({
+        data: {
+          orgId: "system",
+          userId,
+          action: "user.2fa-failed",
+          payload: { ipAddress: req.ip, userAgent: req.headers["user-agent"] }
+        }
+      });
       throw new UnauthorizedError("Invalid 2FA code or recovery code");
     }
-
-    // Sign JWT token
-    const token = jwt.sign({ userId: user.id, email: user.email }, config.jwtSecret, {
-      expiresIn: "24h"
-    });
 
     // Session rotation: invalidate previous sessions
     await prisma.session.deleteMany({
@@ -373,7 +566,40 @@ router.post("/2fa", rateLimiter(5, 900, "2fa"), async (req: Request, res: Respon
       }
     });
 
-    res.status(200).json({ token, user: { id: user.id, email: user.email } });
+    // Sign JWT token containing sessionId (expiry 15m)
+    const token = jwt.sign({ userId: user.id, email: user.email, sessionId: sessionToken }, config.jwtSecret, {
+      expiresIn: "15m"
+    });
+
+    // Generate refresh token (7 days expiry)
+    const refreshToken = crypto.randomBytes(40).toString("hex");
+    const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
+    await redis.set(`refresh-token:${refreshTokenHash}`, user.id, "EX", 7 * 24 * 60 * 60);
+    await redis.sadd(`user-refresh-tokens:${user.id}`, refreshTokenHash);
+
+    // Audit Log
+    await prisma.auditLog.create({
+      data: {
+        orgId: "system",
+        userId: user.id,
+        action: "user.2fa-verify-success",
+        payload: { ipAddress: req.ip, userAgent: req.headers["user-agent"] }
+      }
+    });
+
+    // Set cookie
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production" || config.opspilotMode === "production",
+      sameSite: "strict",
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    res.status(200).json({
+      token,
+      refreshToken, // Expose in body for compatibility and testing
+      user: { id: user.id, email: user.email }
+    });
   } catch (err) {
     next(err);
   }

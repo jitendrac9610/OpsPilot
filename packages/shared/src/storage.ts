@@ -98,13 +98,25 @@ export async function extractArchiveSafely(archive: Buffer, destination: string)
       throw new Error(`Unsupported archive entry type for ${entry.path}`);
     }
 
+    // Symlink rejection using POSIX mode bit: 0o120000 (S_IFLNK)
+    const mode = (entry.externalFileAttributes >>> 16) & 0o170000;
+    const isSymlink = mode === 0o120000;
+    if (isSymlink) {
+      throw new Error(`Unsafe archive entry rejected (symbolic links not allowed): ${entry.path}`);
+    }
+
+    // Zip-bomb / Expanded-size check BEFORE buffer decompression to prevent OOM crash
+    if (entry.uncompressedSize > maxFileBytes) {
+      throw new Error(`Archive file exceeds the per-file size limit: ${entry.path}`);
+    }
+    extractedBytes += entry.uncompressedSize;
+    if (extractedBytes > maxArchiveBytes) {
+      throw new Error("Expanded archive exceeds the configured size limit.");
+    }
+
     const content = await entry.buffer();
     if (content.byteLength > maxFileBytes) {
       throw new Error(`Archive file exceeds the per-file size limit: ${entry.path}`);
-    }
-    extractedBytes += content.byteLength;
-    if (extractedBytes > maxArchiveBytes) {
-      throw new Error("Expanded archive exceeds the configured size limit.");
     }
 
     await fs.promises.mkdir(path.dirname(target), { recursive: true });

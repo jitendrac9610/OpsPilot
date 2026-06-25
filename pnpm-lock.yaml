@@ -75,6 +75,9 @@ importers:
       '@opspilot/remediation-engine':
         specifier: workspace:*
         version: link:../../packages/remediation-engine
+      '@opspilot/resilience-testing':
+        specifier: workspace:*
+        version: link:../../packages/resilience-testing
       '@opspilot/schemas':
         specifier: workspace:*
         version: link:../../packages/schemas

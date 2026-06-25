@@ -10,6 +10,19 @@
 
 import assert from "node:assert";
 import jwt from "jsonwebtoken";
+import dotenv from "dotenv";
+import path from "node:path";
+import fs from "node:fs";
+
+// Load environment variables before database prisma import
+const rootEnv = path.resolve(process.cwd(), ".env");
+const parentEnv = path.resolve(process.cwd(), "../../.env");
+if (fs.existsSync(rootEnv)) {
+  dotenv.config({ path: rootEnv });
+} else if (fs.existsSync(parentEnv)) {
+  dotenv.config({ path: parentEnv });
+}
+
 import { prisma } from "@opspilot/database";
 import { config, generateId } from "@opspilot/shared";
 

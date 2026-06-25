@@ -120,7 +120,8 @@ app.post("/discover", async (req: Request, res: Response, next: NextFunction) =>
     });
 
     // Trigger Indexer Worker asynchronously
-    fetch("http://localhost:4003/index", {
+    const indexerUrl = config.services.indexerWorkerUrl || "http://localhost:4003";
+    fetch(`${indexerUrl}/index`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

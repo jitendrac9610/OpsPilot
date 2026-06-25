@@ -16,6 +16,7 @@
     "@opspilot/workflow-engine": "workspace:*",
     "@opspilot/remediation-engine": "workspace:*",
     "@opspilot/evaluation-worker": "workspace:*",
+    "@opspilot/resilience-testing": "workspace:*",
     "bcrypt": "^5.1.1",
     "cors": "^2.8.5",
     "express": "^4.19.2",

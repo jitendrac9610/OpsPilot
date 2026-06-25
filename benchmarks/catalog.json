@@ -1,0 +1,152 @@
+[
+  {
+    "id": "case-env-missing",
+    "name": "Missing Environment Variables",
+    "category": "env",
+    "failingCommit": "f01env",
+    "fixedCommit": "c01env",
+    "expectedFailure": "process.env.DB_PASSWORD is undefined",
+    "expectedSourceFiles": [".env.example", "src/db.ts"],
+    "expectedSourceSymbols": ["DB_PASSWORD"],
+    "requiredEvidence": ["DB connection error", "undefined"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["DB_PASSWORD=secret"],
+      "filesModified": [".env"]
+    }
+  },
+  {
+    "id": "case-prisma-fail",
+    "name": "Prisma failures",
+    "category": "prisma",
+    "failingCommit": "f02prisma",
+    "fixedCommit": "c02prisma",
+    "expectedFailure": "PrismaClientInitializationError",
+    "expectedSourceFiles": ["prisma/schema.prisma"],
+    "expectedSourceSymbols": ["datasource"],
+    "requiredEvidence": ["Can't reach database server", "PrismaClientInitializationError"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["provider = \"postgresql\""],
+      "filesModified": ["prisma/schema.prisma"]
+    }
+  },
+  {
+    "id": "case-queue-mismatch",
+    "name": "Queue mismatch",
+    "category": "queue",
+    "failingCommit": "f03queue",
+    "fixedCommit": "c03queue",
+    "expectedFailure": "BullMQ queue mismatch",
+    "expectedSourceFiles": ["src/queue.ts"],
+    "expectedSourceSymbols": ["interviews-queue", "interview-queue"],
+    "requiredEvidence": ["queue name mismatch", "interviews-queue"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["interview-queue"],
+      "filesModified": ["src/queue.ts"]
+    }
+  },
+  {
+    "id": "case-absent-worker",
+    "name": "Absent worker",
+    "category": "worker",
+    "failingCommit": "f04worker",
+    "fixedCommit": "c04worker",
+    "expectedFailure": "absent worker",
+    "expectedSourceFiles": ["src/worker.ts"],
+    "expectedSourceSymbols": ["Worker"],
+    "requiredEvidence": ["worker not started", "unprocessed jobs"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["new Worker"],
+      "filesModified": ["src/worker.ts"]
+    }
+  },
+  {
+    "id": "case-websocket-room",
+    "name": "WebSocket room mismatch",
+    "category": "websocket",
+    "failingCommit": "f05ws",
+    "fixedCommit": "c05ws",
+    "expectedFailure": "WebSocket room mismatch",
+    "expectedSourceFiles": ["src/websocket.ts"],
+    "expectedSourceSymbols": ["room-join", "emit"],
+    "requiredEvidence": ["room mismatch", "unauthorized room"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["socket.join(room)"],
+      "filesModified": ["src/websocket.ts"]
+    }
+  },
+  {
+    "id": "case-webhook-sig",
+    "name": "Webhook signature failure",
+    "category": "webhook",
+    "failingCommit": "f06webhook",
+    "fixedCommit": "c06webhook",
+    "expectedFailure": "Stripe signature verification failed",
+    "expectedSourceFiles": ["src/stripe.ts"],
+    "expectedSourceSymbols": ["stripe.webhooks.constructEvent"],
+    "requiredEvidence": ["Webhook Error: signature verification failed"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["req.rawBody"],
+      "filesModified": ["src/stripe.ts"]
+    }
+  },
+  {
+    "id": "case-duplicate-payment",
+    "name": "Duplicate payment",
+    "category": "payment",
+    "failingCommit": "f07payment",
+    "fixedCommit": "c07payment",
+    "expectedFailure": "duplicate payment or not idempotent",
+    "expectedSourceFiles": ["src/failures.ts"],
+    "expectedSourceSymbols": ["processWebhookNotIdempotent"],
+    "requiredEvidence": ["processedEvents.add", "idempotency"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["if (processedEvents.has(eventId))"],
+      "filesModified": ["src/failures.ts"]
+    }
+  },
+  {
+    "id": "case-transaction-race",
+    "name": "Transaction race",
+    "category": "race",
+    "failingCommit": "f08race",
+    "fixedCommit": "c08race",
+    "expectedFailure": "concurrent update race condition",
+    "expectedSourceFiles": ["src/db.ts"],
+    "expectedSourceSymbols": ["transferFundsRace"],
+    "requiredEvidence": ["race condition", "deadlock"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["prisma.$transaction"],
+      "filesModified": ["src/db.ts"]
+    }
+  },
+  {
+    "id": "case-contract-mismatch",
+    "name": "Frontend/backend contract mismatch",
+    "category": "contract",
+    "failingCommit": "f09contract",
+    "fixedCommit": "c09contract",
+    "expectedFailure": "Frontend/backend contract mismatch",
+    "expectedSourceFiles": ["src/failures.ts"],
+    "expectedSourceSymbols": ["getBackendProfileResponse"],
+    "requiredEvidence": ["avatarUrl", "avatar_url"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["avatar_url:"],
+      "filesModified": ["src/failures.ts"]
+    }
+  },
+  {
+    "id": "case-unsafe-migration",
+    "name": "Unsafe migration",
+    "category": "migration",
+    "failingCommit": "f10migration",
+    "fixedCommit": "c10migration",
+    "expectedFailure": "unsafe migration data loss",
+    "expectedSourceFiles": ["prisma/migrations/"],
+    "expectedSourceSymbols": ["DROP COLUMN"],
+    "requiredEvidence": ["unsafe migration", "data loss"],
+    "expectedPatchCharacteristics": {
+      "addedLines": ["ALTER TABLE"],
+      "filesModified": ["prisma/migrations/"]
+    }
+  }
+]

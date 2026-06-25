@@ -62,6 +62,34 @@ export async function enqueueDiagnosticRun(diagnosticRunId: string) {
   }
 }
 
+// GET /api/diagnostic-runs
+router.get("/", async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  try {
+    const runs = await prisma.diagnosticRun.findMany({
+      where: {
+        repository: {
+          project: {
+            organization: {
+              memberships: {
+                some: { userId: req.user!.id }
+              }
+            }
+          }
+        }
+      },
+      include: {
+        repository: true
+      },
+      orderBy: {
+        createdAt: "desc"
+      }
+    });
+    res.status(200).json(runs);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/diagnostic-runs/:id
 router.get("/:id", async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   try {

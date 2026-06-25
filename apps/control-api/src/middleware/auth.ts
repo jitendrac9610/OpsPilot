@@ -28,8 +28,18 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
   const token = authHeader.replace("Bearer ", "");
 
   try {
-    const decoded = jwt.verify(token, config.jwtSecret) as { userId: string; email: string };
+    const decoded = jwt.verify(token, config.jwtSecret) as { userId: string; email: string; sessionId?: string };
     
+    // Verify active database session if sessionId is provided
+    if (decoded.sessionId) {
+      const activeSession = await prisma.session.findUnique({
+        where: { token: decoded.sessionId }
+      });
+      if (!activeSession || activeSession.expiresAt < new Date()) {
+        return next(new UnauthorizedError("Session has been revoked or expired"));
+      }
+    }
+
     // Fetch user from DB to verify active account
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId }

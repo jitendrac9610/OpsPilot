@@ -25,7 +25,8 @@ export const config = {
   services: {
     sandboxControllerUrl: process.env.SANDBOX_CONTROLLER_URL || "http://localhost:4010",
     graphWorkerUrl: process.env.GRAPH_WORKER_URL || "http://localhost:4004",
-    discoveryWorkerUrl: process.env.DISCOVERY_WORKER_URL || "http://localhost:4002"
+    discoveryWorkerUrl: process.env.DISCOVERY_WORKER_URL || "http://localhost:4002",
+    indexerWorkerUrl: process.env.INDEXER_WORKER_URL || "http://localhost:4003"
   },
   sandbox: {
     repositorySubdirectory: process.env.SANDBOX_REPOSITORY_SUBDIRECTORY || "",

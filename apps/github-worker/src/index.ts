@@ -72,18 +72,36 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
     return res.status(401).json({ error: "UNAUTHORIZED", message: "Invalid webhook signature" });
   }
 
-  // 2. Redis-based delivery ID deduplication
+  // 2. Enforce delivery ID presence and check deduplication
   const deliveryId = req.headers["x-github-delivery"];
-  if (deliveryId && typeof deliveryId === "string") {
-    const redisKey = `github-webhook:delivery:${deliveryId}`;
+  if (!deliveryId || typeof deliveryId !== "string") {
+    logger.warn("GitHub webhook delivery ID header 'x-github-delivery' is missing");
+    return res.status(400).json({ error: "BAD_REQUEST", message: "Missing x-github-delivery header" });
+  }
+
+  const redisKey = `github-webhook:delivery:${deliveryId}`;
+  try {
+    const result = await redis.set(redisKey, "1", "EX", 86400, "NX"); // 24 hours TTL
+    if (result !== "OK") {
+      logger.info({ deliveryId }, "Duplicate webhook delivery detected. Ignoring.");
+      return res.status(200).json({ status: "ignored_duplicate", deliveryId });
+    }
+  } catch (err) {
+    logger.error({ err, deliveryId }, "Redis deduplication check failed");
+  }
+
+  // 3. Signature-based replay protection
+  const signature = req.headers["x-hub-signature-256"];
+  if (signature && typeof signature === "string") {
+    const signatureKey = `github-webhook:signature:${signature}`;
     try {
-      const result = await (redis as any).set(redisKey, "1", "NX", "EX", 86400); // 24 hours TTL
-      if (result !== "OK") {
-        logger.info({ deliveryId }, "Duplicate webhook delivery detected. Ignoring.");
-        return res.status(200).json({ status: "ignored_duplicate", deliveryId });
+      const sigResult = await redis.set(signatureKey, "1", "EX", 86400, "NX"); // 24 hours TTL
+      if (sigResult !== "OK") {
+        logger.warn({ signature }, "Duplicate signature (replay attack) detected. Ignoring.");
+        return res.status(200).json({ status: "ignored_replay", message: "Duplicate signature" });
       }
     } catch (err) {
-      logger.error({ err, deliveryId }, "Redis deduplication check failed");
+      logger.error({ err, signature }, "Redis signature replay check failed");
     }
   }
 
@@ -93,8 +111,30 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
   logger.info({ event }, "Received GitHub webhook payload");
 
   try {
-    // 3. Handle push event
+    // 4. Handle push event
     if (event === "push") {
+      // Handle branch deletion
+      if (payload.deleted) {
+        const repositoryId = payload.repository?.id ? String(payload.repository.id) : null;
+        const branch = payload.ref ? payload.ref.replace("refs/heads/", "") : "main";
+        if (repositoryId) {
+          const dbRepo = await prisma.repository.findUnique({
+            where: { id: repositoryId },
+            include: { project: true }
+          });
+          if (dbRepo) {
+            await prisma.auditLog.create({
+              data: {
+                orgId: dbRepo.project.organizationId,
+                action: "github.branch.deleted",
+                payload: { repositoryId, branch }
+              }
+            });
+          }
+        }
+        return res.status(200).json({ status: "branch_deleted", message: "Branch deletion ignored for snapshotting" });
+      }
+
       const repositoryId = payload.repository?.id ? String(payload.repository.id) : null;
       const installationId = payload.installation?.id ? String(payload.installation.id) : null;
 
@@ -102,20 +142,46 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
         return res.status(400).json({ error: "BAD_REQUEST", message: "Missing repository ID" });
       }
 
+      const dbRepo = await prisma.repository.findUnique({
+        where: { id: repositoryId },
+        include: { project: true }
+      });
+      if (!dbRepo) {
+        logger.warn({ repositoryId }, "Repository not found in database");
+        return res.status(404).json({ error: "NOT_FOUND", message: "Repository not found in database" });
+      }
+
+      if (!installationId) {
+        logger.warn({ repositoryId }, "Push event payload is missing installation ID");
+        return res.status(400).json({ error: "BAD_REQUEST", message: "Missing installation ID in payload" });
+      }
+
       // Validate scope / installation mapping
-      if (installationId) {
-        const githubInstall = await prisma.gitHubInstallation.findUnique({
-          where: { repositoryId }
-        });
-        if (!githubInstall || githubInstall.installationId !== installationId) {
-          logger.warn({ repositoryId, installationId }, "Repository installation scope mismatch or unauthorized installation");
-          return res.status(403).json({ error: "UNAUTHORIZED_INSTALLATION", message: "Repository installation scope mismatch" });
-        }
+      const githubInstall = await prisma.gitHubInstallation.findUnique({
+        where: { repositoryId }
+      });
+      if (!githubInstall || githubInstall.installationId !== installationId) {
+        logger.warn({ repositoryId, installationId }, "Repository installation scope mismatch or unauthorized installation");
+        return res.status(403).json({ error: "UNAUTHORIZED_INSTALLATION", message: "Repository installation scope mismatch" });
       }
 
       const gitUrl = payload.repository?.clone_url || "mock_repo_url";
       const branch = payload.ref ? payload.ref.replace("refs/heads/", "") : "main";
       const commitSha = payload.head_commit?.id || `commit_${Date.now()}`;
+
+      // Write Audit Log
+      await prisma.auditLog.create({
+        data: {
+          orgId: dbRepo.project.organizationId,
+          action: "github.push.processed",
+          payload: {
+            repositoryId,
+            commitSha,
+            branch,
+            gitUrl
+          }
+        }
+      });
 
       // Trigger Archiving asynchronously (non-blocking webhook response)
       createCommitSnapshot(repositoryId, gitUrl, commitSha, branch)
@@ -124,9 +190,9 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
       return res.status(202).json({ status: "processing_snapshot", commitSha });
     }
 
-    // 4. Handle installation event
+    // 5. Handle installation event (created, deleted, suspend, unsuspend)
     if (event === "installation") {
-      const action = payload.action; // 'created', 'deleted', 'suspend', 'unsuspend'
+      const action = payload.action;
       const installationId = payload.installation?.id ? String(payload.installation.id) : null;
 
       if (!installationId) {
@@ -135,7 +201,7 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
 
       logger.info({ installationId, action }, "Handling installation event");
 
-      if (action === "created") {
+      if (action === "created" || action === "unsuspend") {
         const repos = payload.repositories || [];
         for (const repo of repos) {
           const repositoryId = String(repo.id);
@@ -153,7 +219,7 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
             await prisma.auditLog.create({
               data: {
                 orgId: dbRepo.project.organizationId,
-                action: "github.installation.created",
+                action: action === "created" ? "github.installation.created" : "github.installation.unsuspended",
                 payload: {
                   repositoryId,
                   installationId,
@@ -163,10 +229,13 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
             });
           }
         }
-        return res.status(200).json({ status: "installation_created_processed", installationId });
+        return res.status(200).json({
+          status: action === "created" ? "installation_created_processed" : "installation_unsuspended_processed",
+          installationId
+        });
       }
 
-      if (action === "deleted") {
+      if (action === "deleted" || action === "suspend") {
         const installations = await prisma.gitHubInstallation.findMany({
           where: { installationId },
           include: { repository: { include: { project: true } } }
@@ -178,7 +247,7 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
           await prisma.auditLog.create({
             data: {
               orgId: inst.repository.project.organizationId,
-              action: "github.installation.deleted",
+              action: action === "deleted" ? "github.installation.deleted" : "github.installation.suspended",
               payload: {
                 repositoryId: inst.repositoryId,
                 installationId
@@ -186,7 +255,10 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
             }
           });
         }
-        return res.status(200).json({ status: "installation_deleted_processed", installationId });
+        return res.status(200).json({
+          status: action === "deleted" ? "installation_deleted_processed" : "installation_suspended_processed",
+          installationId
+        });
       }
 
       return res.status(200).json({ status: "installation_event_acknowledged", action });
