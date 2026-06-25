@@ -1,3 +1,8 @@
+import dotenv from "dotenv";
+import path from "node:path";
+dotenv.config({ path: path.resolve(__dirname, "../../../../.env") });
+process.env.NODE_ENV = "test";
+
 import { prisma } from "@opspilot/database";
 import { getLocalEmbedding, getEmbedding } from "../utils/llm.js";
 import { CodeStore } from "../store/code.js";
@@ -6,7 +11,7 @@ import { RuntimeStore } from "../store/runtime.js";
 import { DocsStore } from "../store/docs.js";
 import { IncidentStore } from "../store/incident.js";
 import { ProjectStore } from "../store/project.js";
-import { RAGPipeline } from "../pipeline.js";
+import { RAGPipeline, RAGContext } from "../pipeline.js";
 
 let failed = false;
 
@@ -127,6 +132,7 @@ async function runTests() {
   assert(graphResults !== null, "Graph results should not be null");
   assert(graphResults!.nodes.length === 2, "Graph traversal should return 2 connected nodes");
   assert(graphResults!.pathsSummary.includes("payment-service"), "Paths summary should mention payment-service");
+  assert((graphResults!.nodes[0] as any).score > (graphResults!.nodes[1] as any).score, "Relevance-aware ranking should rank direct match higher than neighbor");
 
   // ----------------------------------------------------
   // Test 5: Runtime Telemetry RAG Store
@@ -198,6 +204,9 @@ async function runTests() {
   (prisma as any).retrievalQualityAssessment = {
     create: async () => ({})
   };
+  (prisma as any).repositorySnapshot = {
+    findUnique: async () => ({ id: "snap_1", commitSha: "test_sha_123" })
+  };
 
   const pipeline = new RAGPipeline();
   const pipelineContext = await pipeline.retrieveHybridContext("stripe secret payment issue", {
@@ -211,6 +220,267 @@ async function runTests() {
   assert(pipelineContext.codeChunks.length > 0, "Aggregated context should contain code chunks");
   assert(pipelineContext.graphResult !== null, "Aggregated context should contain GraphRAG data");
   assert(pipelineContext.qualityAssessment.assessment === "SUFFICIENT", "Assessment gate should evaluate context as SUFFICIENT");
+  assert(pipelineContext.qualityAssessment.reasons.some(r => r.includes("Causally aligned")), "Quality assessment reasons should contain causal alignment status");
+  assert(pipelineContext.fullContextText.includes("Citation: File [src/index.ts]"), "Full context text should contain explicit file citations");
+  assert(pipelineContext.fullContextText.includes("Artifact: workflowStepRun/`step_run_1`"), "Full context text should contain explicit runtime artifact citations");
+
+  // ----------------------------------------------------
+  // Test 8: RAG Quality Evaluation Benchmark Suite
+  // ----------------------------------------------------
+  console.log("\nRunning RAG Quality Evaluation Benchmark Suite...");
+
+  interface BenchmarkCase {
+    id: string;
+    query: string;
+    requiredSources: string[];
+    forbiddenDistractors: string[];
+    expectedRootCause: string;
+    files: any[];
+    chunks: any[];
+    embeddings: any[];
+    nodes: any[];
+    edges: any[];
+    stepRuns: any[];
+    boundaries: any[];
+    incidentEvents: any[];
+  }
+
+  const benchmarkCases: BenchmarkCase[] = [
+    {
+      id: "case_1_payment",
+      query: "Stripe connection failed due to empty secret",
+      requiredSources: ["src/payment.ts", "payment-service"],
+      forbiddenDistractors: ["src/auth.ts", "auth-service"],
+      expectedRootCause: "src/payment.ts",
+      files: [
+        { id: "payment_f", path: "src/payment.ts" },
+        { id: "auth_f", path: "src/auth.ts" }
+      ],
+      chunks: [
+        { id: "chunk_payment", fileId: "payment_f", content: "function processPayment() { stripe.charge(); }", startLine: 1, endLine: 5 },
+        { id: "chunk_auth", fileId: "auth_f", content: "function authenticate() { jwt.verify(); }", startLine: 1, endLine: 5 }
+      ],
+      embeddings: [
+        { id: "emb_pay", chunkId: "chunk_payment", embedding: JSON.stringify(getLocalEmbedding("stripe connection failed payment")) },
+        { id: "emb_auth", chunkId: "chunk_auth", embedding: JSON.stringify(getLocalEmbedding("jwt authentication")) }
+      ],
+      nodes: [
+        { id: "payment-service", versionId: "arch_v1", type: "service", name: "payment-service", metadata: {} },
+        { id: "auth-service", versionId: "arch_v1", type: "service", name: "auth-service", metadata: {} }
+      ],
+      edges: [
+        { id: "edge_pay", versionId: "arch_v1", source: "payment-service", target: "auth-service", type: "CALLS", evidence: "{}" }
+      ],
+      stepRuns: [
+        { id: "step_pay_fail", workflowRunId: "run_test", status: "FAILED", error: "Stripe secret empty", logs: ["stripe authorization error"] }
+      ],
+      boundaries: [
+        { id: "fb_pay", workflowRunId: "run_test", failedStage: "processPayment", reason: "Missing STRIPE_SECRET_KEY" }
+      ],
+      incidentEvents: []
+    },
+    {
+      id: "case_2_db",
+      query: "Database connection pool saturated under load",
+      requiredSources: ["prisma/schema.prisma", "PostgreSQL Database"],
+      forbiddenDistractors: ["stripe-queue", "external SDK"],
+      expectedRootCause: "prisma/schema.prisma",
+      files: [
+        { id: "prisma_f", path: "prisma/schema.prisma" },
+        { id: "stripe_f", path: "src/stripe-queue.ts" }
+      ],
+      chunks: [
+        { id: "chunk_db", fileId: "prisma_f", content: "datasource db { provider = 'postgresql' }", startLine: 1, endLine: 5 },
+        { id: "chunk_sq", fileId: "stripe_f", content: "class StripeQueue { queue = new Queue(); }", startLine: 1, endLine: 5 }
+      ],
+      embeddings: [
+        { id: "emb_db", chunkId: "chunk_db", embedding: JSON.stringify(getLocalEmbedding("database pool connection postgresql")) },
+        { id: "emb_sq", chunkId: "chunk_sq", embedding: JSON.stringify(getLocalEmbedding("stripe queue handler")) }
+      ],
+      nodes: [
+        { id: "PostgreSQL Database", versionId: "arch_v1", type: "database", name: "PostgreSQL Database", metadata: {} },
+        { id: "stripe-queue", versionId: "arch_v1", type: "queue/topic/event", name: "stripe-queue", metadata: {} }
+      ],
+      edges: [
+        { id: "edge_db", versionId: "arch_v1", source: "stripe-queue", target: "PostgreSQL Database", type: "QUERIES", evidence: "{}" }
+      ],
+      stepRuns: [
+        { id: "step_db_fail", workflowRunId: "run_test", status: "FAILED", error: "database pool saturated", logs: ["Prisma client connection timeout"] }
+      ],
+      boundaries: [
+        { id: "fb_db", workflowRunId: "run_test", failedStage: "dbConnection", reason: "pool limit exceeded" }
+      ],
+      incidentEvents: []
+    }
+  ];
+
+  let activeCase: BenchmarkCase | null = null;
+
+  // Intercept prisma methods dynamically for benchmarking
+  const originalRepositoryFile = (prisma as any).repositoryFile;
+  const originalCodeChunk = (prisma as any).codeChunk;
+  const originalChunkEmbedding = (prisma as any).chunkEmbedding;
+  const originalGraphNode = (prisma as any).graphNode;
+  const originalGraphEdge = (prisma as any).graphEdge;
+  const originalWorkflowStepRun = (prisma as any).workflowStepRun;
+  const originalFailureBoundary = (prisma as any).failureBoundary;
+  const originalIncidentEvent = (prisma as any).incidentEvent;
+  const originalRepositorySnapshot = (prisma as any).repositorySnapshot;
+
+  (prisma as any).repositorySnapshot = {
+    findUnique: async () => ({ id: "snap_1", commitSha: "test_sha_123" })
+  };
+
+  (prisma as any).repositoryFile = {
+    findMany: async () => activeCase ? activeCase.files : originalRepositoryFile.findMany()
+  };
+  (prisma as any).codeChunk = {
+    findMany: async (args: any) => {
+      if (!activeCase) return originalCodeChunk.findMany(args);
+      if (args?.where?.fileId) return activeCase.chunks.filter(c => c.fileId === args.where.fileId);
+      return activeCase.chunks;
+    }
+  };
+  (prisma as any).chunkEmbedding = {
+    findMany: async () => activeCase ? activeCase.embeddings : originalChunkEmbedding.findMany()
+  };
+  (prisma as any).graphNode = {
+    findMany: async () => activeCase ? activeCase.nodes : originalGraphNode.findMany()
+  };
+  (prisma as any).graphEdge = {
+    findMany: async () => activeCase ? activeCase.edges : originalGraphEdge.findMany()
+  };
+  (prisma as any).workflowStepRun = {
+    findMany: async () => activeCase ? activeCase.stepRuns : originalWorkflowStepRun.findMany()
+  };
+  (prisma as any).failureBoundary = {
+    findMany: async () => activeCase ? activeCase.boundaries : originalFailureBoundary.findMany()
+  };
+  (prisma as any).incidentEvent = {
+    findMany: async () => activeCase ? activeCase.incidentEvents : originalIncidentEvent.findMany()
+  };
+
+  function computeMetrics(context: RAGContext, caseData: BenchmarkCase) {
+    const retrievedItems: string[] = [];
+    for (const chunk of context.codeChunks) {
+      retrievedItems.push(chunk.filePath);
+    }
+    if (context.graphResult) {
+      for (const node of context.graphResult.nodes) {
+        retrievedItems.push(node.id);
+      }
+    }
+
+    const required = caseData.requiredSources;
+    const forbidden = caseData.forbiddenDistractors;
+
+    // Recall@5
+    const retrievedAt5 = retrievedItems.slice(0, 5);
+    const recallAt5Count = required.filter(src => retrievedAt5.includes(src)).length;
+    const recallAt5 = required.length > 0 ? recallAt5Count / required.length : 0;
+
+    // Recall@10
+    const retrievedAt10 = retrievedItems.slice(0, 10);
+    const recallAt10Count = required.filter(src => retrievedAt10.includes(src)).length;
+    const recallAt10 = required.length > 0 ? recallAt10Count / required.length : 0;
+
+    // Precision
+    const precisionCount = retrievedItems.filter(item => required.includes(item)).length;
+    const forbiddenCount = retrievedItems.filter(item => forbidden.includes(item)).length;
+    const precision = retrievedItems.length > 0 ? (precisionCount) / (retrievedItems.length + forbiddenCount) : 0;
+
+    // MRR
+    let firstRank = -1;
+    for (let i = 0; i < retrievedItems.length; i++) {
+      if (required.includes(retrievedItems[i])) {
+        firstRank = i + 1;
+        break;
+      }
+    }
+    const mrr = firstRank > 0 ? 1 / firstRank : 0;
+
+    // Root-cause Accuracy
+    const retrievedFiles = context.codeChunks.map((c: any) => c.filePath);
+    const rootCauseAccuracy = retrievedFiles.includes(caseData.expectedRootCause) ? 1.0 : 0.0;
+
+    // Token Count
+    const tokenCount = Math.round(context.fullContextText.length / 4);
+
+    return {
+      recallAt5,
+      recallAt10,
+      precision,
+      mrr,
+      rootCauseAccuracy,
+      tokenCount
+    };
+  }
+
+  const resultsSummary: any[] = [];
+
+  for (const caseData of benchmarkCases) {
+    activeCase = caseData;
+
+    // Retrieve context with Graph
+    const contextWithGraph = await pipeline.retrieveHybridContext(caseData.query, {
+      snapshotId: "snap_1",
+      workflowRunId: "run_test",
+      incidentId: "inc_test",
+      skipRewrite: true,
+      disableGraph: false
+    });
+
+    // Retrieve context without Graph
+    const contextWithoutGraph = await pipeline.retrieveHybridContext(caseData.query, {
+      snapshotId: "snap_1",
+      workflowRunId: "run_test",
+      incidentId: "inc_test",
+      skipRewrite: true,
+      disableGraph: true
+    });
+
+    const metricsWith = computeMetrics(contextWithGraph, caseData);
+    const metricsWithout = computeMetrics(contextWithoutGraph, caseData);
+
+    resultsSummary.push({
+      caseId: caseData.id,
+      withGraph: metricsWith,
+      withoutGraph: metricsWithout
+    });
+
+    // Simple assertions to ensure RAG functions as expected
+    assert(metricsWith.mrr >= metricsWithout.mrr, `MRR with Graph (${metricsWith.mrr}) should be >= without Graph (${metricsWithout.mrr})`);
+    assert(metricsWith.recallAt5 >= metricsWithout.recallAt5, `Recall@5 with Graph (${metricsWith.recallAt5}) should be >= without Graph (${metricsWithout.recallAt5})`);
+  }
+
+  // Restore prisma mocks
+  (prisma as any).repositoryFile = originalRepositoryFile;
+  (prisma as any).codeChunk = originalCodeChunk;
+  (prisma as any).chunkEmbedding = originalChunkEmbedding;
+  (prisma as any).graphNode = originalGraphNode;
+  (prisma as any).graphEdge = originalGraphEdge;
+  (prisma as any).workflowStepRun = originalWorkflowStepRun;
+  (prisma as any).failureBoundary = originalFailureBoundary;
+  (prisma as any).incidentEvent = originalIncidentEvent;
+  (prisma as any).repositorySnapshot = originalRepositorySnapshot;
+
+  activeCase = null;
+
+  // Print formatted results
+  console.log("\n=======================================================");
+  console.log("RAG METRICS EVALUATION BENCHMARK RESULTS:");
+  console.log("=======================================================");
+  console.log("| Metric | With GraphRAG | Without GraphRAG |");
+  console.log("|---|---|---|");
+  const metricsKeys = ["recallAt5", "recallAt10", "precision", "mrr", "rootCauseAccuracy", "tokenCount"];
+  const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
+  for (const k of metricsKeys) {
+    const valWith = avg(resultsSummary.map(r => r.withGraph[k]));
+    const valWithout = avg(resultsSummary.map(r => r.withoutGraph[k]));
+    console.log(`| Average ${k} | ${valWith.toFixed(4)} | ${valWithout.toFixed(4)} |`);
+  }
+  console.log("=======================================================");
+  console.log("✓ RAG Quality Benchmark Suite passed.");
 
   // ----------------------------------------------------
   // Finish
@@ -219,7 +489,7 @@ async function runTests() {
     console.error("\nSome unit tests FAILED. Review errors above.");
     process.exit(1);
   } else {
-    console.log("\nAll RAG & Knowledge Systems Unit Tests PASSED successfully! (7/7)");
+    console.log("\nAll RAG & Knowledge Systems Unit Tests PASSED successfully! (8/8)");
     process.exit(0);
   }
 }

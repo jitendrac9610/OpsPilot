@@ -2,7 +2,11 @@ import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import dotenv from "dotenv";
 import { EndpointContractSchema } from "@opspilot/schemas";
+
+dotenv.config({ path: path.resolve(__dirname, "../../../../.env") });
+process.env.NODE_ENV = "test";
 import { WorkflowDiscoverer } from "../discovery.js";
 import { WorkflowDrivers } from "../drivers.js";
 import { AssertionEngine } from "../assertions.js";
@@ -163,6 +167,181 @@ async function runTests() {
   );
   const missingAuth = new AuthBootstrapper("http://fixture.local");
   assert.strictEqual(await missingAuth.bootstrapAuth([expressOrder], "admin"), null);
+
+  // 1. Test Form Encoding and CSRF Probing / Injection
+  console.log("\nTesting Form Encoding, CSRF, and Redirects...");
+  const customAuthContracts = [
+    EndpointContractSchema.parse({
+      id: "POST /auth/form-login",
+      method: "POST",
+      path: "/auth/form-login",
+      framework: "openapi",
+      source: { file: "openapi.yaml", line: 1 },
+      tags: ["auth"],
+      parameters: [],
+      responses: [{ status: "200", headers: {}, content: {} }],
+      security: [],
+      middleware: [],
+      requiredEnvironment: [],
+      roles: ["user"],
+      permissions: [],
+      prisma: [],
+      evidence: ["test fixture"],
+      confidence: 1,
+      requestBody: {
+        required: true,
+        source: "openapi.yaml",
+        content: {
+          "application/x-www-form-urlencoded": {
+            type: "object",
+            required: ["email", "password"],
+            properties: {
+              email: { type: "string" },
+              password: { type: "string" }
+            }
+          }
+        }
+      }
+    })
+  ];
+
+  let testCalls: Array<{ url: string; method: string; headers: Record<string, string>; body: any }> = [];
+  const testAuth = new AuthBootstrapper("http://fixture.local", {
+    credentialsFactory: () => ({
+      username: "user@example.com",
+      password: "UserPassword42!",
+      profile: { role: "user" }
+    }),
+    request: (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method || "GET";
+      const headers = (init?.headers || {}) as Record<string, string>;
+      let body: any = init?.body;
+      
+      testCalls.push({ url, method, headers, body });
+
+      if (url.endsWith("/csrf") || url.endsWith("/auth/form-login") && method === "GET") {
+        return new Response(JSON.stringify({ csrfToken: "csrf-token-xyz" }), {
+          status: 200,
+          headers: { "set-cookie": "csrf_cookie=csrf-token-xyz; Path=/; HttpOnly" }
+        });
+      }
+
+      if (url.endsWith("/auth/form-login") && method === "POST") {
+        assert.strictEqual(headers["Content-Type"], "application/x-www-form-urlencoded");
+        assert.ok(String(body).includes("email=user%40example.com"));
+        assert.ok(headers["X-CSRF-Token"] === "csrf-token-xyz" || String(body).includes("_csrf=csrf-token-xyz"));
+        
+        return new Response(JSON.stringify({ redirect: "http://fixture.local/oauth/callback" }), {
+          status: 200,
+          headers: { "set-cookie": "session=active-session; Path=/; HttpOnly" }
+        });
+      }
+
+      if (url.endsWith("/oauth/callback")) {
+        return new Response(JSON.stringify({
+          data: { accessToken: "form-access-token", tenantId: "tenant-999" }
+        }), {
+          status: 200
+        });
+      }
+
+      return new Response(JSON.stringify({ success: true }));
+    }) as typeof fetch
+  });
+
+  const testSession = await testAuth.bootstrapAuth(customAuthContracts, "user");
+  assert.ok(testSession);
+  assert.strictEqual(testSession.accessToken, "form-access-token");
+  assert.strictEqual(testSession.tenantId, "tenant-999");
+  assert.ok(testSession.cookies.some(c => c.includes("session=active-session")));
+  console.log("✓ Form encoding, CSRF injection, and OAuth redirects verified.");
+
+  // 2. Test IdentityScenario Bootstrapping with Tenant Propagation
+  console.log("\nTesting IdentityScenario Bootstrapping...");
+  const scenarioContracts = [
+    {
+      ...createAuthContracts()[0],
+      requestBody: {
+        required: true,
+        source: "openapi.yaml",
+        content: {
+          "application/json": {
+            type: "object" as const,
+            required: ["email", "password"],
+            properties: {
+              email: { type: "string" as const, format: "email" },
+              password: { type: "string" as const },
+              role: { type: "string" as const },
+              tenantId: { type: "string" as const }
+            }
+          }
+        }
+      }
+    },
+    createAuthContracts()[1]
+  ];
+  
+  const scenario = {
+    id: "scen-1",
+    name: "Multi-User Tenant Scenario",
+    description: "Owner creates tenant and Member joins",
+    identities: [
+      {
+        name: "tenant-owner",
+        role: "admin",
+        relations: []
+      },
+      {
+        name: "tenant-member",
+        role: "user",
+        relations: [
+          { target: "tenant-owner", type: "same-tenant" as const }
+        ]
+      }
+    ]
+  };
+
+  let scenarioCalls: Array<{ url: string; method: string; body: any }> = [];
+  const scenarioAuth = new AuthBootstrapper("http://fixture.local", {
+    request: (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method || "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      
+      scenarioCalls.push({ url, method, body });
+
+      if (url.endsWith("/auth/register")) {
+        if (body.email.includes("tenant-member")) {
+          assert.strictEqual(body.tenantId, "org-abc-123");
+        }
+        return new Response(JSON.stringify({ success: true }), { status: 201 });
+      }
+
+      if (url.endsWith("/auth/login")) {
+        if (body.email.includes("tenant-owner")) {
+          return new Response(JSON.stringify({
+            accessToken: "token-owner",
+            tenantId: "org-abc-123"
+          }), { status: 200 });
+        } else {
+          return new Response(JSON.stringify({
+            accessToken: "token-member"
+          }), { status: 200 });
+        }
+      }
+
+      return new Response(JSON.stringify({ success: true }));
+    }) as typeof fetch
+  });
+
+  const scenarioSessions = await scenarioAuth.bootstrapScenario(scenarioContracts, scenario);
+  assert.strictEqual(scenarioSessions.size, 2);
+  assert.strictEqual(scenarioSessions.get("tenant-owner")?.accessToken, "token-owner");
+  assert.strictEqual(scenarioSessions.get("tenant-owner")?.tenantId, "org-abc-123");
+  assert.strictEqual(scenarioSessions.get("tenant-member")?.accessToken, "token-member");
+  console.log("✓ IdentityScenario same-tenant bootstrap propagation verified.");
+
 
   const planner = new StatefulWorkflowPlanner("http://fixture.local");
   const plan = await planner.planWorkflow(
@@ -371,8 +550,8 @@ const razorpaySig = req.headers["x-razorpay-signature"];
     graph.edges
   );
 
-  const queueHypothesis = hypotheses.find((h: any) => h.description.includes("queue-name mismatch"));
-  const webhookHypothesis = hypotheses.find((h: any) => h.description.includes("signature verification failure"));
+  const queueHypothesis = hypotheses.find((h: any) => (h.description || h.statement || "").includes("queue-name mismatch"));
+  const webhookHypothesis = hypotheses.find((h: any) => (h.description || h.statement || "").includes("signature verification failure"));
   
   assert.ok(queueHypothesis, "Expected queue-name mismatch hypothesis");
   assert.strictEqual(queueHypothesis.status, "SUPPORTED");
@@ -381,6 +560,39 @@ const razorpaySig = req.headers["x-razorpay-signature"];
   console.log("✓ Hypothesis-driven failure localization verified.");
 
   await fs.promises.rm(repositoryRoot, { recursive: true, force: true });
+
+  console.log("\nRunning Phase 7 Sandbox Hardening and Operational tests...");
+  const { runPhase7Tests } = await import("./phase7.test.js");
+  await runPhase7Tests();
+
+  console.log("\nRunning Phase 8 WebSocket Automation tests...");
+  const { runPhase8Tests } = await import("./phase8.test.js");
+  await runPhase8Tests();
+
+  console.log("\nRunning Phase 9 Webhook Automation tests...");
+  const { runPhase9Tests } = await import("./phase9.test.js");
+  await runPhase9Tests();
+
+  console.log("\nRunning Phase 10 Queue and Worker Intelligence tests...");
+  const { runPhase10Tests } = await import("./phase10.test.js");
+  await runPhase10Tests();
+
+  console.log("\nRunning Phase 11 Database Invariant Generation tests...");
+  const { runPhase11Tests } = await import("./phase11.test.js");
+  await runPhase11Tests();
+
+  console.log("\nRunning Phase 12 Browser Automation & Discovery tests...");
+  const { runPhase12Tests } = await import("./phase12.test.js");
+  await runPhase12Tests();
+
+  console.log("\nRunning Phase 13 Cross-service Correlation tests...");
+  const { runPhase13Tests } = await import("./phase13.test.js");
+  await runPhase13Tests();
+
+  console.log("\nRunning Phase 14 Root-cause Localization tests...");
+  const { runPhase14Tests } = await import("./phase14.test.js");
+  await runPhase14Tests();
+
   console.log("ALL WORKFLOW ENGINE TESTS PASSED");
 }
 

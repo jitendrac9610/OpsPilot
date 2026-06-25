@@ -44,6 +44,9 @@ export class AgentOrchestrator {
   private isProduction: boolean;
   private approvedActionIds: string[] = [];
   private dbFallback = false;
+  private extraRetrievalContexts: string[] = [];
+  private stateDwellTimes = new Map<AgentState, number>();
+  private lastActions: AgentDecision[] = [];
 
   constructor(config: OrchestratorConfig) {
     this.agentRunId = config.agentRunId || `run-${Math.random().toString(36).substring(2, 9)}`;
@@ -88,15 +91,57 @@ export class AgentOrchestrator {
       this.dbFallback = true;
     }
 
-    // Initialize the planner with a default initial planning structure
-    await this.planner.initializePlan([
+    const repoPlan = await this.generateRepositorySpecificPlan();
+    await this.planner.initializePlan(repoPlan);
+  }
+
+  private async generateRepositorySpecificPlan(): Promise<string[]> {
+    const basePlan = [
       "Discover running services and configurations",
       "Retrieve log events and identify failures",
-      "Formulate root cause hypotheses",
-      "Verify and reproduce the incident",
+      "Formulate root cause hypotheses"
+    ];
+
+    if (this.snapshotId && !this.dbFallback) {
+      try {
+        const archVersion = await prisma.architectureVersion.findFirst({
+          where: { snapshotId: this.snapshotId },
+          orderBy: { createdAt: "desc" }
+        });
+        if (archVersion) {
+          const nodes = await prisma.graphNode.findMany({
+            where: { versionId: archVersion.id }
+          });
+          const techList: string[] = [];
+          const nodeNames = nodes.map(n => n.name.toLowerCase());
+          
+          if (nodeNames.some(name => name.includes("prisma"))) techList.push("Prisma Database");
+          if (nodeNames.some(name => name.includes("queue") || name.includes("bullmq") || name.includes("job"))) techList.push("BullMQ Queue");
+          if (nodeNames.some(name => name.includes("socket") || name.includes("websocket"))) techList.push("WebSocket Connection");
+          if (nodeNames.some(name => name.includes("webhook") || name.includes("stripe"))) techList.push("Stripe Webhook");
+
+          if (techList.length > 0) {
+            basePlan.push(`Verify and reproduce the incident focusing on ${techList.join(", ")} integration`);
+          } else {
+            basePlan.push("Verify and reproduce the incident");
+          }
+        } else {
+          basePlan.push("Verify and reproduce the incident");
+        }
+      } catch (err) {
+        logger.warn({ err }, "Failed to generate repository-specific plan details. Falling back.");
+        basePlan.push("Verify and reproduce the incident");
+      }
+    } else {
+      basePlan.push("Verify and reproduce the incident");
+    }
+
+    basePlan.push(
       "Propose correction and request verification approval",
       "Monitor recovery and complete resolution"
-    ]);
+    );
+
+    return basePlan;
   }
 
   /**
@@ -127,6 +172,10 @@ export class AgentOrchestrator {
         logger.warn({ err }, "RAG retrieval failed.");
         contextText += `\n(RAG_RETRIEVAL_FAILED: No repository context was added.)`;
       }
+    }
+
+    if (this.extraRetrievalContexts.length > 0) {
+      contextText += `\n\n## Targeted Retrieval Context:\n` + this.extraRetrievalContexts.join("\n\n");
     }
 
     // Append memory, planner, hypothesis and evidence information to prompt
@@ -201,10 +250,28 @@ export class AgentOrchestrator {
 
   private async processDecision(decision: AgentDecision) {
     switch (decision.type) {
-      case "retrieve":
-        // LLM wants more RAG data
+      case "retrieve": {
         logger.info({ query: decision.request }, "Decision: retrieve extra context");
+        const query = typeof decision.request.query === "string"
+          ? decision.request.query
+          : JSON.stringify(decision.request);
+
+        if (this.snapshotId) {
+          try {
+            const extraCtx = await this.rag.retrieveHybridContext(query, {
+              snapshotId: this.snapshotId,
+              agentRunId: this.agentRunId,
+              workflowRunId: this.workflowRunId,
+              incidentId: this.incidentId,
+              skipRewrite: true
+            });
+            this.extraRetrievalContexts.push(extraCtx.fullContextText);
+          } catch (err: any) {
+            logger.warn({ err }, "Dynamic targeted RAG retrieval failed.");
+          }
+        }
         break;
+      }
 
       case "call_tool": {
         const { tool, arguments: args } = decision;
@@ -358,103 +425,143 @@ export class AgentOrchestrator {
   private transitionStateBasedOnDecision(decision: AgentDecision) {
     const currentState = this.stateMachine.getState();
 
+    // Track dwell time and repeated actions
+    const dwell = (this.stateDwellTimes.get(currentState) || 0) + 1;
+    this.stateDwellTimes.set(currentState, dwell);
+
+    if (dwell > 5) {
+      this.transitionToNeedsHuman(`State dwell time limit exceeded in state: ${currentState}`);
+      return;
+    }
+
+    this.lastActions.push(decision);
+    if (this.lastActions.length > 5) this.lastActions.shift();
+    if (this.lastActions.length >= 3) {
+      const last3 = this.lastActions.slice(-3);
+      if (last3.every(act => JSON.stringify(act) === JSON.stringify(last3[0]))) {
+        this.transitionToNeedsHuman(`Repeated action loop detected.`);
+        return;
+      }
+    }
+
+    let matched = false;
+
+    // 1. Perform primary transitions
     switch (currentState) {
       case "CREATED":
-        this.transitionWhen(
-          decision.type === "call_tool" && decision.tool === "list_services",
-          "DISCOVERING",
-          "Service discovery evidence was not requested."
-        );
+        if (decision.type === "call_tool" && decision.tool === "list_services") {
+          this.stateMachine.transitionTo("DISCOVERING");
+          this.stateDwellTimes.set("DISCOVERING", 0);
+          matched = true;
+        }
         break;
       case "DISCOVERING":
-        this.transitionWhen(
-          decision.type === "call_tool" && decision.tool === "index_repository",
-          "INDEXING",
-          "Repository indexing was not executed."
-        );
+        if (decision.type === "call_tool" && decision.tool === "index_repository") {
+          this.stateMachine.transitionTo("INDEXING");
+          this.stateDwellTimes.set("INDEXING", 0);
+          matched = true;
+        }
         break;
       case "INDEXING":
-        this.transitionWhen(
-          decision.type === "replan" || decision.type === "retrieve",
-          "PLANNING",
-          "No evidence-based plan was produced from indexing."
-        );
+        if (decision.type === "replan" || decision.type === "retrieve") {
+          this.stateMachine.transitionTo("PLANNING");
+          this.stateDwellTimes.set("PLANNING", 0);
+          matched = true;
+        }
         break;
       case "PLANNING":
-        this.transitionWhen(
-          decision.type === "retrieve" || decision.type === "replan",
-          "RETRIEVING",
-          "The plan did not request supporting evidence."
-        );
+        if (decision.type === "retrieve" || decision.type === "replan") {
+          this.stateMachine.transitionTo("RETRIEVING");
+          this.stateDwellTimes.set("RETRIEVING", 0);
+          matched = true;
+        }
         break;
       case "RETRIEVING":
-        this.transitionWhen(
-          decision.type === "call_tool" || decision.type === "retrieve",
-          "INVESTIGATING",
-          "No runtime evidence was retrieved."
-        );
+        if (decision.type === "call_tool" || decision.type === "retrieve") {
+          this.stateMachine.transitionTo("INVESTIGATING");
+          this.stateDwellTimes.set("INVESTIGATING", 0);
+          matched = true;
+        }
         break;
       case "INVESTIGATING":
-        this.transitionWhen(
-          decision.type === "update_hypotheses" && this.evidenceManager.getEvidence().length > 0,
-          "DIAGNOSING",
-          "Diagnosis requires at least one evidence artifact."
-        );
+        if (decision.type === "update_hypotheses" && this.evidenceManager.getEvidence().length > 0) {
+          this.stateMachine.transitionTo("DIAGNOSING");
+          this.stateDwellTimes.set("DIAGNOSING", 0);
+          matched = true;
+        }
         break;
       case "DIAGNOSING":
-        this.transitionWhen(
-          decision.type === "call_tool" && decision.tool === "run_tests",
-          "REPRODUCING",
-          "The original failure was not reproduced."
-        );
+        if (decision.type === "call_tool" && decision.tool === "run_tests") {
+          this.stateMachine.transitionTo("REPRODUCING");
+          this.stateDwellTimes.set("REPRODUCING", 0);
+          matched = true;
+        }
         break;
       case "REPRODUCING":
-        this.transitionWhen(
-          decision.type === "propose_change",
-          "PROPOSING_FIX",
-          "No bounded change was proposed."
-        );
+        if (decision.type === "propose_change") {
+          this.stateMachine.transitionTo("PROPOSING_FIX");
+          this.stateDwellTimes.set("PROPOSING_FIX", 0);
+          matched = true;
+        }
         break;
       case "PROPOSING_FIX":
-        this.transitionWhen(
-          decision.type === "call_tool" && decision.tool === "apply_patch",
-          "APPLYING_SANDBOX_CHANGE",
-          "The proposed patch was not applied in the sandbox."
-        );
+        if (decision.type === "call_tool" && decision.tool === "apply_patch") {
+          this.stateMachine.transitionTo("APPLYING_SANDBOX_CHANGE");
+          this.stateDwellTimes.set("APPLYING_SANDBOX_CHANGE", 0);
+          matched = true;
+        }
         break;
       case "APPLYING_SANDBOX_CHANGE": {
         const verified = decision.type === "request_approval" && this.approvalHasVerificationEvidence(decision.approval);
         if (verified) {
           this.stateMachine.transitionTo("VERIFYING_FIX");
           this.stateMachine.transitionTo("AWAITING_APPROVAL");
-        } else {
-          this.transitionToNeedsHuman("Approval was requested without complete verification evidence.");
+          this.stateDwellTimes.set("AWAITING_APPROVAL", 0);
+          matched = true;
         }
         break;
       }
       case "VERIFYING_FIX":
-        this.transitionWhen(
-          decision.type === "request_approval" && this.approvalHasVerificationEvidence(decision.approval),
-          "AWAITING_APPROVAL",
-          "Build, workflow, regression, and security evidence are required before approval."
-        );
+        if (decision.type === "request_approval" && this.approvalHasVerificationEvidence(decision.approval)) {
+          this.stateMachine.transitionTo("AWAITING_APPROVAL");
+          this.stateDwellTimes.set("AWAITING_APPROVAL", 0);
+          matched = true;
+        }
         break;
       case "AWAITING_APPROVAL":
         if (decision.type === "call_tool" && decision.tool === "approve_action") {
           this.stateMachine.transitionTo("APPLYING_APPROVED_ACTION");
+          this.stateDwellTimes.set("APPLYING_APPROVED_ACTION", 0);
+          matched = true;
         }
         break;
       case "APPLYING_APPROVED_ACTION":
         this.stateMachine.transitionTo("MONITORING_RECOVERY");
+        this.stateDwellTimes.set("MONITORING_RECOVERY", 0);
+        matched = true;
         break;
       case "MONITORING_RECOVERY":
         if (decision.type === "complete") {
           this.stateMachine.transitionTo("COMPLETED");
+          matched = true;
         }
         break;
       case "NEEDS_HUMAN":
         this.stateMachine.transitionTo("PLANNING");
+        this.stateDwellTimes.set("PLANNING", 0);
+        matched = true;
         break;
+    }
+
+    if (!matched) {
+      if (["retrieve", "replan", "update_hypotheses"].includes(decision.type)) {
+        return;
+      }
+      let reason = `Unexpected action '${decision.type}' in state '${currentState}'`;
+      if (decision.type === "call_tool") {
+        reason = `Unexpected tool call '${decision.tool}' in state '${currentState}'`;
+      }
+      this.transitionToNeedsHuman(reason);
     }
 
     if (decision.type === "needs_human") {

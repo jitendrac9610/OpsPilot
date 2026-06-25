@@ -255,3 +255,175 @@ export const WorkflowRunSchema = z.object({
 });
 
 export type WorkflowRun = z.infer<typeof WorkflowRunSchema>;
+
+export const IdentityRelationSchema = z.object({
+  target: z.string(),
+  type: z.enum(["owner", "non-owner", "same-tenant", "cross-tenant", "sender", "recipient", "seller", "buyer"])
+});
+
+export type IdentityRelation = z.infer<typeof IdentityRelationSchema>;
+
+export const IdentityDefinitionSchema = z.object({
+  name: z.string(),
+  role: z.string().default("user"),
+  relations: z.array(IdentityRelationSchema).default([]),
+  credentials: z.object({
+    username: z.string().optional(),
+    password: z.string().optional(),
+    profile: z.record(z.any()).optional()
+  }).optional(),
+  endpoints: z.object({
+    registerPath: z.string().optional(),
+    loginPath: z.string().optional()
+  }).optional()
+});
+
+export type IdentityDefinition = z.infer<typeof IdentityDefinitionSchema>;
+
+export const IdentityScenarioSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  identities: z.array(IdentityDefinitionSchema)
+});
+
+export type IdentityScenario = z.infer<typeof IdentityScenarioSchema>;
+
+export const WebSocketEventDirectionEnum = z.enum([
+  "client-to-server",
+  "server-to-client"
+]);
+
+export type WebSocketEventDirection = z.infer<typeof WebSocketEventDirectionEnum>;
+
+export const WebSocketEventSchema = z.object({
+  name: z.string(),
+  direction: WebSocketEventDirectionEnum,
+  payload: ContractSchemaNodeSchema.optional(),
+  acknowledgement: ContractSchemaNodeSchema.optional(),
+  rooms: z.array(z.string()).default([]),
+  source: z.object({
+    file: z.string(),
+    line: z.number().int().positive().optional()
+  }).optional()
+});
+
+export type WebSocketEvent = z.infer<typeof WebSocketEventSchema>;
+
+export const WebSocketContractSchema = z.object({
+  id: z.string(),
+  url: z.string().default("ws://localhost:4000"),
+  framework: z.enum(["socket.io", "ws", "custom"]),
+  namespaces: z.array(z.string()).default([]),
+  middleware: z.array(z.string()).default([]),
+  handshakeAuth: z.record(z.any()).default({}),
+  events: z.array(WebSocketEventSchema).default([]),
+  redisAdapter: z.boolean().default(false),
+  source: z.object({
+    file: z.string(),
+    line: z.number().int().positive().optional()
+  }).optional()
+});
+
+export type WebSocketContract = z.infer<typeof WebSocketContractSchema>;
+
+export const WebhookProviderEnum = z.enum(["stripe", "razorpay", "github", "custom"]);
+export type WebhookProvider = z.infer<typeof WebhookProviderEnum>;
+
+export const WebhookContractSchema = z.object({
+  id: z.string(),
+  type: z.enum(["incoming", "outgoing"]),
+  provider: WebhookProviderEnum,
+  endpointUrl: z.string(),
+  eventTypes: z.array(z.string()).default([]),
+  signingSecretEnvVar: z.string().optional(),
+  payloadSchema: ContractSchemaNodeSchema.optional(),
+  source: z.object({
+    file: z.string(),
+    line: z.number().int().positive().optional()
+  }).optional()
+});
+
+export type WebhookContract = z.infer<typeof WebhookContractSchema>;
+
+export const QueueContractSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  type: z.enum(["bullmq", "redis-pubsub", "custom"]).default("bullmq"),
+  producers: z.array(z.object({
+    file: z.string(),
+    line: z.number().int().positive().optional()
+  })).default([]),
+  consumers: z.array(z.object({
+    file: z.string(),
+    line: z.number().int().positive().optional(),
+    handler: z.string().optional()
+  })).default([]),
+  payloadSchema: ContractSchemaNodeSchema.optional(),
+  source: z.object({
+    file: z.string(),
+    line: z.number().int().positive().optional()
+  }).optional()
+});
+
+export type QueueContract = z.infer<typeof QueueContractSchema>;
+
+export const BrowserPageElementSchema = z.object({
+  type: z.enum(["input", "button", "select", "checkbox", "link", "form", "other"]),
+  selector: z.string(),
+  name: z.string().optional(),
+  label: z.string().optional(),
+  placeholder: z.string().optional(),
+  testId: z.string().optional()
+});
+
+export type BrowserPageElement = z.infer<typeof BrowserPageElementSchema>;
+
+export const BrowserContractSchema = z.object({
+  id: z.string(),
+  path: z.string(),
+  elements: z.array(BrowserPageElementSchema).default([]),
+  source: z.object({
+    file: z.string(),
+    line: z.number().int().positive().optional()
+  }).optional()
+});
+
+export type BrowserContract = z.infer<typeof BrowserContractSchema>;
+
+export const EvidenceProtocolEnum = z.enum([
+  "http",
+  "websocket",
+  "webhook",
+  "queue",
+  "database",
+  "browser",
+  "other"
+]);
+
+export type EvidenceProtocol = z.infer<typeof EvidenceProtocolEnum>;
+
+export const EvidenceEventSchema = z.object({
+  id: z.string(),
+  runId: z.string(),
+  workflowId: z.string(),
+  correlationId: z.string(),
+  parentId: z.string().optional(),
+  timestamp: z.string(),
+  service: z.string(),
+  protocol: EvidenceProtocolEnum,
+  operation: z.string(),
+  timing: z.number().optional(),
+  success: z.boolean(),
+  request: z.any().optional(),
+  response: z.any().optional(),
+  sourceSymbol: z.string().optional(),
+  artifacts: z.record(z.any()).default({})
+});
+
+export type EvidenceEvent = z.infer<typeof EvidenceEventSchema>;
+
+
+
+
+

@@ -45,57 +45,86 @@ export class GraphStore {
       return { nodes: [], edges: [], pathsSummary: "" };
     }
 
-    // 3. Find match start nodes
+    // 3. Find match start nodes and compute initial scores
     const queryTerms = getTerms(query);
-    const startNodeIds = new Set<string>();
+    const nodeScores = new Map<string, number>();
 
     for (const node of nodes) {
       const nodeNameLower = node.name.toLowerCase();
       const nodeTypeLower = node.type.toLowerCase();
       const metadataStr = JSON.stringify(node.metadata || "").toLowerCase();
 
-      // Direct match or term match
-      if (
-        queryTerms.some(
-          (term) =>
-            nodeNameLower.includes(term) ||
-            nodeTypeLower.includes(term) ||
-            metadataStr.includes(term)
-        )
-      ) {
-        startNodeIds.add(node.id);
+      let score = 0;
+      if (queryTerms.length > 0) {
+        for (const term of queryTerms) {
+          if (nodeNameLower === term) {
+            score += 2.0;
+          } else if (nodeNameLower.includes(term)) {
+            score += 1.0;
+          }
+          if (nodeTypeLower.includes(term)) {
+            score += 0.5;
+          }
+          if (metadataStr.includes(term)) {
+            score += 0.3;
+          }
+        }
+      }
+      if (score > 0) {
+        nodeScores.set(node.id, score);
       }
     }
 
     // If no node matches query terms, use all services/databases/queues as starting points
-    if (startNodeIds.size === 0) {
+    if (nodeScores.size === 0) {
       for (const node of nodes) {
         if (["service", "database", "queue/topic/event", "external SDK"].includes(node.type)) {
-          startNodeIds.add(node.id);
+          nodeScores.set(node.id, 0.1);
         }
       }
     }
 
-    // 4. Traverse neighbors (1-hop inbound and outbound)
-    const activeNodeIds = new Set<string>(startNodeIds);
+    // 4. Traverse neighbors (1-hop inbound and outbound) and propagate scores
+    const activeNodeIds = new Set<string>(nodeScores.keys());
     const activeEdges: typeof edges = [];
 
     for (const edge of edges) {
-      if (startNodeIds.has(edge.source) || startNodeIds.has(edge.target)) {
+      const hasSrc = nodeScores.has(edge.source);
+      const hasTgt = nodeScores.has(edge.target);
+      if (hasSrc || hasTgt) {
         activeNodeIds.add(edge.source);
         activeNodeIds.add(edge.target);
         activeEdges.push(edge);
+
+        // Propagate score to the neighbor
+        if (hasSrc && !hasTgt) {
+          const propagated = (nodeScores.get(edge.source) || 0) * 0.5;
+          nodeScores.set(edge.target, Math.max(nodeScores.get(edge.target) || 0, propagated));
+        } else if (hasTgt && !hasSrc) {
+          const propagated = (nodeScores.get(edge.target) || 0) * 0.5;
+          nodeScores.set(edge.source, Math.max(nodeScores.get(edge.source) || 0, propagated));
+        }
       }
     }
 
-    const activeNodes = nodes.filter((n) => activeNodeIds.has(n.id));
+    // Filter and sort active nodes by score descending
+    const activeNodes = nodes
+      .filter((n) => activeNodeIds.has(n.id))
+      .map((n) => ({
+        id: n.id,
+        type: n.type,
+        name: n.name,
+        metadata: n.metadata,
+        score: nodeScores.get(n.id) || 0,
+      }))
+      .sort((a, b) => b.score - a.score);
 
     // 5. Construct a textual summary of paths and evidence
     const summaryLines: string[] = [];
     summaryLines.push("### Architecture Subgraph (GraphRAG Context)");
     summaryLines.push("#### Nodes:");
     for (const node of activeNodes) {
-      summaryLines.push(`- **${node.name}** (Type: \`${node.type}\`, ID: \`${node.id}\`)`);
+      summaryLines.push(`- **${node.name}** (Type: \`${node.type}\`, ID: \`${node.id}\`, Score: ${node.score.toFixed(2)})`);
     }
 
     summaryLines.push("\n#### Key Call and Data Flow Paths:");
@@ -121,7 +150,7 @@ export class GraphStore {
     }
 
     return {
-      nodes: activeNodes.map((n) => ({ id: n.id, type: n.type, name: n.name, metadata: n.metadata })),
+      nodes: activeNodes,
       edges: activeEdges.map((e) => ({ source: e.source, target: e.target, type: e.type, evidence: e.evidence })),
       pathsSummary: summaryLines.join("\n"),
     };

@@ -16,7 +16,7 @@ export interface HTTPDriverConfig {
 }
 
 export interface BrowserDriverConfig {
-  action: "navigate" | "click" | "fill" | "assert_visible";
+  action: "navigate" | "click" | "fill" | "assert_visible" | "select" | "check" | "uncheck" | "upload_file" | "hover" | "focus" | "press_key" | "wait_for_selector" | "set_viewport";
   url?: string;
   selector?: string;
   text?: string;
@@ -24,6 +24,11 @@ export interface BrowserDriverConfig {
   sessionId?: string;
   timeoutMs?: number;
   correlationId?: string;
+  value?: string | string[];
+  filePath?: string;
+  key?: string;
+  width?: number;
+  height?: number;
 }
 
 export interface WebSocketDriverConfig {
@@ -172,6 +177,51 @@ export class WorkflowDrivers {
         if (!config.selector) throw new Error("Selector is required for assert_visible action");
         success = await page.isVisible(config.selector);
         logMessage = `Asserted visibility of selector ${config.selector} -> ${success}`;
+      } else if (config.action === "select") {
+        if (!config.selector || config.value === undefined) throw new Error("Selector and value are required for select action");
+        await page.selectOption(config.selector, config.value);
+        success = true;
+        logMessage = `Selected option ${config.value} in ${config.selector}`;
+      } else if (config.action === "check") {
+        if (!config.selector) throw new Error("Selector is required for check action");
+        await page.check(config.selector);
+        success = true;
+        logMessage = `Checked checkbox matching selector ${config.selector}`;
+      } else if (config.action === "uncheck") {
+        if (!config.selector) throw new Error("Selector is required for uncheck action");
+        await page.uncheck(config.selector);
+        success = true;
+        logMessage = `Unchecked checkbox matching selector ${config.selector}`;
+      } else if (config.action === "upload_file") {
+        if (!config.selector || !config.filePath) throw new Error("Selector and filePath are required for upload_file action");
+        await page.setInputFiles(config.selector, config.filePath);
+        success = true;
+        logMessage = `Uploaded file ${config.filePath} to ${config.selector}`;
+      } else if (config.action === "hover") {
+        if (!config.selector) throw new Error("Selector is required for hover action");
+        await page.hover(config.selector);
+        success = true;
+        logMessage = `Hovered over element matching selector ${config.selector}`;
+      } else if (config.action === "focus") {
+        if (!config.selector) throw new Error("Selector is required for focus action");
+        await page.focus(config.selector);
+        success = true;
+        logMessage = `Focused element matching selector ${config.selector}`;
+      } else if (config.action === "press_key") {
+        if (!config.selector || !config.key) throw new Error("Selector and key are required for press_key action");
+        await page.press(config.selector, config.key);
+        success = true;
+        logMessage = `Pressed key ${config.key} on element matching selector ${config.selector}`;
+      } else if (config.action === "wait_for_selector") {
+        if (!config.selector) throw new Error("Selector is required for wait_for_selector action");
+        await page.waitForSelector(config.selector, { state: "visible" });
+        success = true;
+        logMessage = `Waited for selector ${config.selector} to be visible`;
+      } else if (config.action === "set_viewport") {
+        if (config.width === undefined || config.height === undefined) throw new Error("Width and height are required for set_viewport action");
+        await page.setViewportSize({ width: config.width, height: config.height });
+        success = true;
+        logMessage = `Set viewport size to ${config.width}x${config.height}`;
       }
 
       const newConsoleErrors = consoleErrors.slice(errorOffset);

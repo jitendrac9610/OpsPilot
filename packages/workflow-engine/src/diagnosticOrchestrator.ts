@@ -3,6 +3,8 @@ import { logger, config, storage } from "@opspilot/shared";
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
+import crypto from "node:crypto";
+import { EvidenceEvent } from "@opspilot/schemas";
 import { WorkflowDiscoverer } from "./discovery.js";
 import { StatefulWorkflowPlanner } from "./statefulPlanner.js";
 import { AuthBootstrapper } from "./authBootstrapper.js";
@@ -62,6 +64,12 @@ export class DiagnosticRunOrchestrator {
 
     if (run.status === "CANCELLED" || run.status === "COMPLETED" || run.status === "FAILED") {
       logger.info({ diagnosticRunId: this.id, status: run.status }, "DiagnosticRun is already in final state. Skipping.");
+      if (run.status === "CANCELLED") {
+        const currentSandboxId = (run.artifacts as any)?.sandboxId;
+        if (currentSandboxId) {
+          await this.cleanupSandbox(currentSandboxId);
+        }
+      }
       return;
     }
 
@@ -76,7 +84,89 @@ export class DiagnosticRunOrchestrator {
 
     let snapshotId = run.snapshotId;
     let artifacts = (run.artifacts as any) || {};
+    let sandboxId = artifacts.sandboxId;
+    let baseApiUrl = artifacts.baseApiUrl;
 
+    // Self-healing recovery checks on resume
+    const stagesAfterSandboxStart = ["BOOTSTRAP_AUTH", "PLANNING_WORKFLOW", "EXECUTING_WORKFLOW", "LOCALIZING_FAILURE"];
+    if (stagesAfterSandboxStart.includes(run.stage) && sandboxId) {
+      logger.info({ diagnosticRunId: this.id, sandboxId }, "Resuming run. Checking sandbox services status.");
+      let servicesActive = false;
+      let newEndpoints: any[] = [];
+      let newServices: any[] = [];
+      try {
+        const checkRes = await fetch(`${config.services.sandboxControllerUrl}/api/sandboxes/${sandboxId}/services`);
+        if (checkRes.ok) {
+          const body = await checkRes.json() as any;
+          if (body.success && Array.isArray(body.services) && body.services.length > 0) {
+            servicesActive = true;
+            newServices = body.services;
+            newEndpoints = body.services.flatMap((s: any) => s.endpoints || []);
+          }
+        }
+      } catch (err: any) {
+        logger.warn({ err: err.message }, "Error checking sandbox services status during resume");
+      }
+
+      if (!servicesActive) {
+        logger.info({ diagnosticRunId: this.id }, "Sandbox services are inactive. Attempting self-healing recovery.");
+        try {
+          const runRes = await fetch(`${config.services.sandboxControllerUrl}/api/sandboxes/${sandboxId}/run`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ environment: {} })
+          });
+          if (runRes.ok) {
+            const runResult = await runRes.json() as any;
+            if (runResult.success) {
+              const apiEndpoint = runResult.endpoints?.find((e: any) => e.kind === "api" || e.kind === "application") || runResult.endpoints?.[0];
+              baseApiUrl = apiEndpoint ? apiEndpoint.externalUrl : "http://localhost:4000";
+              artifacts.baseApiUrl = baseApiUrl;
+              newEndpoints = runResult.endpoints || [];
+              newServices = runResult.services || [];
+
+              // Save the updated endpoints back to the run
+              run = await prisma.diagnosticRun.update({
+                where: { id: this.id },
+                data: {
+                  discoveredServices: {
+                    ...(run.discoveredServices as any || {}),
+                    sandboxEndpoints: newEndpoints,
+                    sandboxServices: newServices
+                  },
+                  artifacts: artifacts
+                },
+                include: { repository: true }
+              });
+              logger.info({ diagnosticRunId: this.id }, "Self-healing: sandbox services recovered successfully.");
+              servicesActive = true;
+            }
+          }
+        } catch (recoveryErr: any) {
+          logger.warn({ err: recoveryErr.message }, "Self-healing recovery via startup failed.");
+        }
+
+        if (!servicesActive) {
+          logger.warn({ diagnosticRunId: this.id }, "Recovery failed. Rolling back to SANDBOX_PROVISION for a clean run.");
+          delete artifacts.sandboxId;
+          delete artifacts.baseApiUrl;
+          sandboxId = undefined;
+          baseApiUrl = undefined;
+          run = await prisma.diagnosticRun.update({
+            where: { id: this.id },
+            data: {
+              stage: "SANDBOX_PROVISION",
+              artifacts: artifacts
+            },
+            include: { repository: true }
+          });
+        }
+      } else {
+        logger.info({ diagnosticRunId: this.id }, "Sandbox services are active. No self-healing required.");
+      }
+    }
+
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 1: CLONING (Git snapshot creation)
     // ==========================================
@@ -142,6 +232,7 @@ export class DiagnosticRunOrchestrator {
       }
     }
 
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 2: DISCOVERING (Capability detection)
     // ==========================================
@@ -195,6 +286,7 @@ export class DiagnosticRunOrchestrator {
       }
     }
 
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 3: INDEXING (AST indexing & Static audit)
     // ==========================================
@@ -242,10 +334,11 @@ export class DiagnosticRunOrchestrator {
       }
     }
 
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 4: SANDBOX_PROVISION (Allocate sandbox)
     // ==========================================
-    let sandboxId = artifacts.sandboxId;
+    sandboxId = artifacts.sandboxId;
     if (run.stage === "SANDBOX_PROVISION") {
       logger.info({ diagnosticRunId: this.id }, "Stage: SANDBOX_PROVISION");
       try {
@@ -280,10 +373,11 @@ export class DiagnosticRunOrchestrator {
       }
     }
 
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 5: SANDBOX_START (Run sandbox services)
     // ==========================================
-    let baseApiUrl = artifacts.baseApiUrl;
+    baseApiUrl = artifacts.baseApiUrl;
     if (run.stage === "SANDBOX_START") {
       logger.info({ diagnosticRunId: this.id }, "Stage: SANDBOX_START");
       try {
@@ -303,6 +397,7 @@ export class DiagnosticRunOrchestrator {
         const apiEndpoint = runResult.endpoints?.find((e: any) => e.kind === "api" || e.kind === "application") || runResult.endpoints?.[0];
         baseApiUrl = apiEndpoint ? apiEndpoint.externalUrl : "http://localhost:4000";
         artifacts.baseApiUrl = baseApiUrl;
+        artifacts.sandboxStartedAt = new Date().toISOString();
 
         run = await prisma.diagnosticRun.update({
           where: { id: this.id },
@@ -323,6 +418,7 @@ export class DiagnosticRunOrchestrator {
       }
     }
 
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 6: BOOTSTRAP_AUTH (Bootstrap users/sessions)
     // ==========================================
@@ -345,12 +441,23 @@ export class DiagnosticRunOrchestrator {
 
         const discoverer = new WorkflowDiscoverer(false);
         const contracts = await discoverer.discoverContracts(tempDir);
+        const wsContracts = await discoverer.discoverWebSocketContracts(tempDir);
+        const webhookContracts = await discoverer.discoverWebhookContracts(tempDir);
+        const queueContracts = await discoverer.discoverQueueContracts(tempDir);
+        const browserContracts = await discoverer.discoverBrowserContracts(tempDir);
         await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
 
         // Save discovered contracts to DiagnosticRun
+        artifacts.wsContracts = wsContracts;
+        artifacts.webhookContracts = webhookContracts;
+        artifacts.queueContracts = queueContracts;
+        artifacts.browserContracts = browserContracts;
         await prisma.diagnosticRun.update({
           where: { id: this.id },
-          data: { contracts: contracts as any }
+          data: {
+            contracts: contracts as any,
+            artifacts: artifacts as any
+          }
         });
 
         // Bootstrap
@@ -378,6 +485,7 @@ export class DiagnosticRunOrchestrator {
       }
     }
 
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 7: PLANNING_WORKFLOW (Workflow planner)
     // ==========================================
@@ -388,9 +496,13 @@ export class DiagnosticRunOrchestrator {
         if (!baseApiUrl) throw new Error("Missing baseApiUrl for workflow planning");
         const contracts = run.contracts as any[];
         if (!contracts) throw new Error("Missing contracts for workflow planning");
+        const wsContracts = (run.artifacts as any)?.wsContracts || [];
+        const webhookContracts = (run.artifacts as any)?.webhookContracts || [];
+        const queueContracts = (run.artifacts as any)?.queueContracts || [];
+        const browserContracts = (run.artifacts as any)?.browserContracts || [];
 
         const planner = new StatefulWorkflowPlanner(baseApiUrl);
-        plan = await planner.planWorkflow(run.repository.projectId, contracts);
+        plan = await planner.planWorkflow(run.repository.projectId, contracts, wsContracts, webhookContracts, queueContracts, browserContracts);
 
         // Save synthetic workflow to DB
         const workflowName = `Diagnostic Workflow - ${Date.now()}`;
@@ -420,6 +532,7 @@ export class DiagnosticRunOrchestrator {
       }
     }
 
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 8: EXECUTING_WORKFLOW (Workflow replay & asserts)
     // ==========================================
@@ -485,11 +598,18 @@ export class DiagnosticRunOrchestrator {
         }
 
         // Run pre-run DB snapshot
-        await assertionEngine.assertDBState({
-          action: "snapshot",
-          snapshotId: `${workflowRunId}-pre`,
-          table: "User"
-        });
+        const affectedTables = getAffectedTables(plan, (run.contracts || []) as any[]);
+        for (const table of affectedTables) {
+          try {
+            await assertionEngine.assertDBState({
+              action: "snapshot",
+              snapshotId: `${workflowRunId}-pre-${table}`,
+              table
+            });
+          } catch (err: any) {
+            logger.warn({ table, err: err.message }, "Failed to capture pre-run database snapshot");
+          }
+        }
 
         const interpolate = (val: any): any => {
           if (typeof val === "string") {
@@ -535,8 +655,10 @@ export class DiagnosticRunOrchestrator {
         };
 
         const stepResults: any[] = [];
+        const stepIdToEventId = new Map<string, string>();
 
         for (const step of plan.steps) {
+          const stepStart = Date.now();
           const configWithVars = interpolate(step.config || {});
           configWithVars.correlationId = correlationId;
           
@@ -571,6 +693,31 @@ export class DiagnosticRunOrchestrator {
               stepSuccess = res.success;
               stepLog = res.log;
               if (!res.success) stepError = "Webhook simulation failed";
+            } else if (step.type === "WAIT_FOR_JOB") {
+              const queueConfig = {
+                queueName: configWithVars.queueName,
+                jobId: configWithVars.jobId,
+                event: configWithVars.event,
+                state: configWithVars.state || "completed",
+                payloadContains: configWithVars.payloadContains,
+                minRetries: configWithVars.minRetries
+              };
+              const timeout = configWithVars.timeoutMs || 5000;
+              const interval = 500;
+              const start = Date.now();
+              let lastRes: any = { success: false, log: "No attempt made" };
+              while (Date.now() - start < timeout) {
+                lastRes = await assertionEngine.assertQueueEvent(queueConfig);
+                if (lastRes.success) {
+                  break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, interval));
+              }
+              stepSuccess = lastRes.success;
+              stepLog = lastRes.log;
+              if (!lastRes.success) {
+                stepError = `Queue job assertion failed: ${lastRes.log}`;
+              }
             } else {
               stepSuccess = true;
               stepLog = `Skipped unknown step type: ${step.type}`;
@@ -599,6 +746,55 @@ export class DiagnosticRunOrchestrator {
             error: stepError || undefined
           });
 
+          const duration = Date.now() - stepStart;
+          let protocol: "http" | "websocket" | "webhook" | "queue" | "browser" | "other" = "other";
+          if (step.type === "HTTP_REQUEST" || step.type === "CREATE_USER" || step.type === "AUTHENTICATE") {
+            protocol = "http";
+          } else if (step.type === "BROWSER_ACTION") {
+            protocol = "browser";
+          } else if (step.type === "WEBSOCKET_OPEN") {
+            protocol = "websocket";
+          } else if (step.type === "SIMULATE_WEBHOOK") {
+            protocol = "webhook";
+          } else if (step.type === "WAIT_FOR_JOB") {
+            protocol = "queue";
+          }
+
+          const dependsOn = step.config?.dependsOn || [];
+          const parentId = dependsOn.length > 0 ? stepIdToEventId.get(dependsOn[0]) : undefined;
+          const eventId = `evt_${crypto.randomUUID()}`;
+          stepIdToEventId.set(step.id, eventId);
+
+          const evidenceEvent: EvidenceEvent = {
+            id: eventId,
+            runId: this.id,
+            workflowId: artifacts.workflowId || "unknown",
+            correlationId,
+            parentId,
+            timestamp: new Date().toISOString(),
+            service: "api",
+            protocol,
+            operation: step.name,
+            timing: duration,
+            success: stepSuccess,
+            request: {
+              action: configWithVars.action,
+              url: configWithVars.url || configWithVars.endpointUrl,
+              method: configWithVars.method,
+              selector: configWithVars.selector,
+              queueName: configWithVars.queueName,
+              event: configWithVars.event
+            },
+            response: {
+              status: stepSuccess ? "success" : "failed",
+              error: stepError || undefined,
+              logs: [stepLog]
+            },
+            artifacts: {}
+          };
+
+          await correlationManager.recordEvidenceEvent(this.id, evidenceEvent);
+
           stepResults.push({
             stepId: step.id,
             name: step.name,
@@ -623,35 +819,67 @@ export class DiagnosticRunOrchestrator {
         }
 
         // Run post assertions
-        const dbAssertion = await assertionEngine.assertDBState({
-          action: "diff",
-          snapshotId: `${workflowRunId}-pre`,
-          table: "User"
-        });
+        for (const table of affectedTables) {
+          try {
+            const dbAssertionStart = Date.now();
+            const dbAssertion = await assertionEngine.assertDBState({
+              action: "diff",
+              snapshotId: `${workflowRunId}-pre-${table}`,
+              table
+            });
+            const dbAssertionDuration = Date.now() - dbAssertionStart;
 
-        await correlationManager.recordTraceEvent(workflowRunId, {
-          timestamp: new Date().toISOString(),
-          service: "database",
-          component: "database",
-          action: "Post-run Diff Assertion",
-          logs: [dbAssertion.log],
-          error: dbAssertion.success ? undefined : "Database diff assertion failed"
-        });
+            await correlationManager.recordTraceEvent(workflowRunId, {
+              timestamp: new Date().toISOString(),
+              service: "database",
+              component: "database",
+              action: `Post-run Diff Assertion (${table})`,
+              logs: [dbAssertion.log],
+              error: dbAssertion.success ? undefined : `Database diff assertion failed for ${table}`
+            });
 
-        if (!dbAssertion.success) {
-          overallSuccess = false;
-          if (!failedStepName) {
-            failedStepName = "Post-run Database Assertion";
-            stepFailureReason = dbAssertion.log;
+            // Find parentId from the last executed step's event ID
+            const lastStepResult = stepResults[stepResults.length - 1];
+            const lastEventId = lastStepResult ? stepIdToEventId.get(lastStepResult.stepId) : undefined;
+
+            await correlationManager.recordEvidenceEvent(this.id, {
+              id: `evt_${crypto.randomUUID()}`,
+              runId: this.id,
+              workflowId: artifacts.workflowId || "unknown",
+              correlationId,
+              parentId: lastEventId,
+              timestamp: new Date().toISOString(),
+              service: "database",
+              protocol: "database",
+              operation: `Post-run Diff Assertion (${table})`,
+              timing: dbAssertionDuration,
+              success: dbAssertion.success,
+              request: { action: "diff", table, snapshotId: `${workflowRunId}-pre-${table}` },
+              response: { log: dbAssertion.log },
+              artifacts: {}
+            });
+
+            if (!dbAssertion.success) {
+              overallSuccess = false;
+              if (!failedStepName) {
+                failedStepName = `Post-run Database Assertion (${table})`;
+                stepFailureReason = dbAssertion.log;
+              }
+            }
+          } catch (err: any) {
+            logger.warn({ table, err: err.message }, "Failed to run post-run database diff assertion");
           }
         }
 
         await correlationManager.completeWorkflowRun(workflowRunId, overallSuccess ? "COMPLETED" : "FAILED");
 
         if (overallSuccess) {
+          // Clean up database records
+          await runDatabaseCleanup(assertionEngine, affectedTables, variables);
+
           // All steps passed! Clean up sandbox and complete.
           await this.cleanupSandbox(sandboxId);
-          await prisma.diagnosticRun.update({
+          const completedRun = await prisma.diagnosticRun.update({
             where: { id: this.id },
             data: {
               status: "COMPLETED",
@@ -659,6 +887,7 @@ export class DiagnosticRunOrchestrator {
               completedAt: new Date()
             }
           });
+          await this.recordUsageMetrics(completedRun);
         } else {
           // Step failed. Save failure details and proceed to localization.
           artifacts.failedStepName = failedStepName;
@@ -678,6 +907,7 @@ export class DiagnosticRunOrchestrator {
       }
     }
 
+    if (await this.checkCancelled(sandboxId)) return;
     // ==========================================
     // Stage 9: LOCALIZING_FAILURE (Root-cause localization)
     // ==========================================
@@ -751,7 +981,7 @@ export class DiagnosticRunOrchestrator {
 
         await this.cleanupSandbox(sandboxId);
 
-        await prisma.diagnosticRun.update({
+        const completedRun = await prisma.diagnosticRun.update({
           where: { id: this.id },
           data: {
             status: "FAILED",
@@ -761,9 +991,10 @@ export class DiagnosticRunOrchestrator {
             completedAt: new Date()
           }
         });
+        await this.recordUsageMetrics(completedRun);
       } catch (err: any) {
         await this.cleanupSandbox(sandboxId);
-        await prisma.diagnosticRun.update({
+        const completedRun = await prisma.diagnosticRun.update({
           where: { id: this.id },
           data: {
             status: "FAILED",
@@ -772,6 +1003,7 @@ export class DiagnosticRunOrchestrator {
             completedAt: new Date()
           }
         });
+        await this.recordUsageMetrics(completedRun);
       }
     }
   }
@@ -790,7 +1022,7 @@ export class DiagnosticRunOrchestrator {
       logger.warn({ cleanupErr }, "Failed to clean up sandbox on fail");
     }
 
-    await prisma.diagnosticRun.update({
+    const completedRun = await prisma.diagnosticRun.update({
       where: { id: this.id },
       data: {
         status: "FAILED",
@@ -799,6 +1031,7 @@ export class DiagnosticRunOrchestrator {
         completedAt: new Date()
       }
     });
+    await this.recordUsageMetrics(completedRun);
   }
 
   private async cleanupSandbox(sandboxId: string | undefined): Promise<void> {
@@ -813,6 +1046,120 @@ export class DiagnosticRunOrchestrator {
       }
     } catch (err) {
       logger.error({ err, sandboxId }, "Exception cleaning up sandbox container");
+    }
+  }
+
+  private async checkCancelled(sandboxId?: string): Promise<boolean> {
+    const current = await prisma.diagnosticRun.findUnique({
+      where: { id: this.id },
+      select: { status: true, artifacts: true }
+    });
+    if (current?.status === "CANCELLED") {
+      logger.info({ diagnosticRunId: this.id }, "DiagnosticRun cancellation detected midway. Cleaning up resources.");
+      const currentSandboxId = sandboxId || (current.artifacts as any)?.sandboxId;
+      if (currentSandboxId) {
+        await this.cleanupSandbox(currentSandboxId);
+      }
+      const completedRun = {
+        ...current,
+        id: this.id,
+        repositoryId: (await prisma.diagnosticRun.findUnique({ where: { id: this.id }, select: { repositoryId: true } }))?.repositoryId
+      };
+      await this.recordUsageMetrics(completedRun);
+      return true;
+    }
+    return false;
+  }
+
+  private async recordUsageMetrics(completedRun: any): Promise<void> {
+    try {
+      const artifacts = (completedRun.artifacts || {}) as any;
+      const sandboxStartedAtStr = artifacts.sandboxStartedAt;
+      if (sandboxStartedAtStr) {
+        const sandboxStartedAt = new Date(sandboxStartedAtStr);
+        const completedAt = completedRun.completedAt || new Date();
+        const durationMs = completedAt.getTime() - sandboxStartedAt.getTime();
+        const minutes = Math.ceil(durationMs / 60000);
+
+        const repo = await prisma.repository.findUnique({
+          where: { id: completedRun.repositoryId },
+          include: { project: true }
+        });
+        const orgId = repo?.project.organizationId || "default-org";
+
+        await prisma.usageRecord.create({
+          data: {
+            orgId,
+            dimension: "sandbox_minutes",
+            quantity: minutes,
+            timestamp: new Date()
+          }
+        });
+        logger.info({ diagnosticRunId: this.id, minutes, orgId }, "Recorded sandbox usage metrics");
+      }
+    } catch (err: any) {
+      logger.warn({ err: err.message }, "Failed to record sandbox usage metrics");
+    }
+  }
+}
+
+export function getAffectedTables(plan: any, contracts: any[]): string[] {
+  const affectedTables = new Set<string>();
+  if (plan && Array.isArray(plan.steps)) {
+    for (const step of plan.steps) {
+      if (step.config?.contractId) {
+        const contract = contracts.find(c => c.id === step.config.contractId);
+        if (contract) {
+          if (Array.isArray(contract.prisma) && contract.prisma.length > 0) {
+            for (const p of contract.prisma) {
+              if (p.model) affectedTables.add(p.model);
+            }
+          } else {
+            const pathSegments = contract.path.split("/").filter(Boolean);
+            const resource = pathSegments.find((s: string) => !s.startsWith(":") && !s.startsWith("{") && s !== "api" && s !== "v1");
+            if (resource) affectedTables.add(resource);
+          }
+        }
+      }
+    }
+  }
+  if (affectedTables.size === 0) {
+    affectedTables.add("User");
+  }
+  return [...affectedTables];
+}
+
+export async function runDatabaseCleanup(
+  assertionEngine: any,
+  affectedTables: string[],
+  variables: Record<string, any>
+): Promise<void> {
+  logger.info({ affectedTables }, "Starting database cleanup for affected tables");
+  for (const table of affectedTables) {
+    const candidates = [
+      `${table.toLowerCase()}s.id`,
+      `${table.toLowerCase()}.id`,
+      `${table}.id`
+    ];
+    let foundId: any = undefined;
+    for (const candidate of candidates) {
+      if (variables[candidate]) {
+        foundId = variables[candidate];
+        break;
+      }
+    }
+
+    if (foundId) {
+      logger.info({ table, id: foundId }, "Cleaning up generated database record");
+      try {
+        await assertionEngine.assertDBState({
+          action: "cleanup",
+          table,
+          whereClause: { id: foundId }
+        });
+      } catch (err: any) {
+        logger.warn({ table, id: foundId, err: err.message }, "Database cleanup action failed");
+      }
     }
   }
 }

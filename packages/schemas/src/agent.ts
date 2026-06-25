@@ -41,14 +41,14 @@ export const RetryClassificationEnum = z.enum([
 export type RetryClassification = z.infer<typeof RetryClassificationEnum>;
 
 export const AgentDecisionSchema = z.union([
-  z.object({ type: z.literal("retrieve"), request: z.record(z.any()) }),
-  z.object({ type: z.literal("call_tool"), tool: z.string(), arguments: z.any() }),
-  z.object({ type: z.literal("update_hypotheses"), updates: z.array(z.record(z.any())) }),
-  z.object({ type: z.literal("replan"), reason: z.string() }),
-  z.object({ type: z.literal("propose_change"), plan: z.record(z.any()) }),
-  z.object({ type: z.literal("request_approval"), approval: z.record(z.any()) }),
-  z.object({ type: z.literal("complete"), conclusion: z.record(z.any()) }),
-  z.object({ type: z.literal("needs_human"), missingEvidence: z.array(z.string()) })
+  z.object({ type: z.literal("retrieve"), request: z.record(z.any()), simulated: z.boolean().optional() }),
+  z.object({ type: z.literal("call_tool"), tool: z.string(), arguments: z.any(), simulated: z.boolean().optional() }),
+  z.object({ type: z.literal("update_hypotheses"), updates: z.array(z.record(z.any())), simulated: z.boolean().optional() }),
+  z.object({ type: z.literal("replan"), reason: z.string(), simulated: z.boolean().optional() }),
+  z.object({ type: z.literal("propose_change"), plan: z.record(z.any()), simulated: z.boolean().optional() }),
+  z.object({ type: z.literal("request_approval"), approval: z.record(z.any()), simulated: z.boolean().optional() }),
+  z.object({ type: z.literal("complete"), conclusion: z.record(z.any()), simulated: z.boolean().optional() }),
+  z.object({ type: z.literal("needs_human"), missingEvidence: z.array(z.string()), simulated: z.boolean().optional() })
 ]);
 
 export type AgentDecision = z.infer<typeof AgentDecisionSchema>;

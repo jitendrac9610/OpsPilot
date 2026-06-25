@@ -1,6 +1,20 @@
 import { prisma } from "@opspilot/database";
 import { logger } from "@opspilot/shared";
-import { CorrelationManager, TraceEvent } from "./correlation.js";
+import { EvidenceEvent } from "@opspilot/schemas";
+import { CorrelationManager } from "./correlation.js";
+
+export interface HypothesisInfo {
+  statement: string;
+  sourceSymbols: Array<{
+    file: string;
+    lineRange?: string;
+  }>;
+  supportingEvidence: string[];
+  contradictingEvidence: string[];
+  confirmationExperiment: string;
+  confidence: number;
+  status: "SUPPORTED" | "CONTRADICTED" | "NEUTRAL";
+}
 
 export interface LocalizationReport {
   boundaryId: string;
@@ -13,12 +27,7 @@ export interface LocalizationReport {
     lineRange?: string;
   };
   failingConfiguration?: string;
-  hypotheses: Array<{
-    description: string;
-    confidence: number;
-    status: "SUPPORTED" | "CONTRADICTED" | "NEUTRAL";
-    evidence: string[];
-  }>;
+  hypotheses: HypothesisInfo[];
   finalRootCause?: string;
 }
 
@@ -37,7 +46,7 @@ export class FailureLocalizer {
   ): Promise<string> {
     logger.warn({ workflowRunId, failedStage, reason, snapshotId }, "Localizing failed workflow stage");
 
-    const timeline = await this.correlationManager.getCorrelationTimeline(workflowRunId);
+    const timeline = await this.correlationManager.getEvidenceTimeline(workflowRunId);
     const report = await this.analyzeTimeline(timeline, failedStage, reason, snapshotId, workflowRunId);
 
     let boundaryId = `fb-${Math.random().toString(36).substring(2, 9)}`;
@@ -61,7 +70,7 @@ export class FailureLocalizer {
   }
 
   private async analyzeTimeline(
-    timeline: TraceEvent[],
+    timeline: EvidenceEvent[],
     failedStage: string,
     reason: string,
     snapshotId?: string,
@@ -72,9 +81,12 @@ export class FailureLocalizer {
 
     // Find the first error or failed event in the timeline
     for (const event of timeline) {
-      if (event.error || (event.logs && event.logs.some(l => l.includes("failed") || l.includes("error") || l.includes("500")))) {
+      const hasError = !event.success || event.response?.error || (event.response?.logs && event.response.logs.some((l: string) => l.includes("failed") || l.includes("error") || l.includes("500")));
+      if (hasError) {
         affectedService = event.service;
-        errorLog = event.error || (event.logs ? event.logs.join("\n") : undefined);
+        const errStr = event.response?.error || "";
+        const logsStr = event.response?.logs ? event.response.logs.join("\n") : "";
+        errorLog = `${errStr}\n${logsStr}`.trim();
         break;
       }
     }
@@ -107,7 +119,7 @@ export class FailureLocalizer {
 
     // Formulate hypotheses based on logs and graph
     const hypotheses = await this.generateHypotheses(errorLog, failingConfiguration, nodes, edges, workflowRunId);
-    const finalRootCause = hypotheses.find(h => h.status === "SUPPORTED")?.description || "Unknown runtime failure";
+    const finalRootCause = hypotheses.find(h => h.status === "SUPPORTED")?.statement || "Unknown runtime failure";
 
     return {
       boundaryId: `fb-${Math.random().toString(36).substring(2, 9)}`,
@@ -161,41 +173,53 @@ export class FailureLocalizer {
     nodes: any[],
     edges: any[],
     workflowRunId?: string
-  ): Promise<LocalizationReport["hypotheses"]> {
-    const list: LocalizationReport["hypotheses"] = [];
+  ): Promise<HypothesisInfo[]> {
+    const list: HypothesisInfo[] = [];
 
     if (missingConfig) {
       list.push({
-        description: `Missing required environment variable: ${missingConfig}`,
+        statement: `Missing required environment variable: ${missingConfig}`,
+        sourceSymbols: [{ file: "src/config.ts" }],
+        supportingEvidence: [`Log explicitly states configuration parameter ${missingConfig} is missing or empty.`],
+        contradictingEvidence: [],
+        confirmationExperiment: `Define environment variable ${missingConfig} in .env or task execution container and verify connection succeeds.`,
         confidence: 95,
-        status: "SUPPORTED",
-        evidence: [`Log explicitly states configuration parameter ${missingConfig} is missing or empty.`]
+        status: "SUPPORTED"
       });
     } else {
       list.push({
-        description: `Missing required environment variable`,
+        statement: `Missing required environment variable`,
+        sourceSymbols: [],
+        supportingEvidence: [],
+        contradictingEvidence: ["No explicit environment variables matching error pattern found."],
+        confirmationExperiment: "Verify that all required environment variables are set in the runtime.",
         confidence: 40,
-        status: "NEUTRAL",
-        evidence: ["No explicit environment variables matching error pattern found."]
+        status: "NEUTRAL"
       });
     }
 
     // Prisma / Database schema mismatch hypothesis
     const hasDbError = log.includes("prisma") || log.includes("database") || log.includes("relation") || log.includes("foreign key");
     list.push({
-      description: "Database schema mismatch or Prisma model out of sync",
+      statement: "Database schema mismatch or Prisma model out of sync",
+      sourceSymbols: [{ file: "prisma/schema.prisma" }],
+      supportingEvidence: hasDbError ? ["Prisma client or SQL relation error in stack trace."] : [],
+      contradictingEvidence: hasDbError ? [] : ["No Prisma or SQL database exceptions detected in application logs."],
+      confirmationExperiment: "Run prisma db push or migration deploy on the database sandbox to sync Schema.",
       confidence: hasDbError ? 85 : 10,
-      status: hasDbError ? "SUPPORTED" : "NEUTRAL",
-      evidence: hasDbError ? ["Prisma client or SQL relation error in stack trace."] : []
+      status: hasDbError ? "SUPPORTED" : "NEUTRAL"
     });
 
     // Network connection/timeout hypothesis
     const hasNetworkError = log.includes("ECONNREFUSED") || log.includes("timeout") || log.includes("fetch failed");
     list.push({
-      description: "Service connection refused or network timeout",
+      statement: "Service connection refused or network timeout",
+      sourceSymbols: [],
+      supportingEvidence: hasNetworkError ? ["Connection error message matched in logs."] : [],
+      contradictingEvidence: hasNetworkError ? [] : ["No service network timeouts or refused connections found in trace logs."],
+      confirmationExperiment: "Perform an HTTP health check on target port and verify container networking is active.",
       confidence: hasNetworkError ? 90 : 10,
-      status: hasNetworkError ? "SUPPORTED" : "NEUTRAL",
-      evidence: hasNetworkError ? ["Connection error message matched in logs."] : []
+      status: hasNetworkError ? "SUPPORTED" : "NEUTRAL"
     });
 
     // Queue Name Mismatch hypothesis
@@ -215,13 +239,16 @@ export class FailureLocalizer {
       for (const cons of onlyConsumers) {
         if (shareSignificantWord(prod.name, cons.name)) {
           list.push({
-            description: `BullMQ queue-name mismatch: producer publishes to '${prod.name}' but worker consumes from '${cons.name}'`,
-            confidence: 95,
-            status: "SUPPORTED",
-            evidence: [
+            statement: `BullMQ queue-name mismatch: producer publishes to '${prod.name}' but worker consumes from '${cons.name}'`,
+            sourceSymbols: [{ file: "src/queue.ts" }],
+            supportingEvidence: [
               `Queue '${prod.name}' has publishers but no consumers.`,
               `Queue '${cons.name}' has consumers but no publishers.`
-            ]
+            ],
+            contradictingEvidence: [],
+            confirmationExperiment: "Update queue consumer initialization to match the producer queue name.",
+            confidence: 95,
+            status: "SUPPORTED"
           });
         }
       }
@@ -244,13 +271,16 @@ export class FailureLocalizer {
       for (const cons of onlyInngestConsumers) {
         if (shareSignificantWord(prod.name, cons.name)) {
           list.push({
-            description: `Inngest event-name mismatch: event sent is '${prod.name}' but function triggers on '${cons.name}'`,
-            confidence: 95,
-            status: "SUPPORTED",
-            evidence: [
+            statement: `Inngest event-name mismatch: event sent is '${prod.name}' but function triggers on '${cons.name}'`,
+            sourceSymbols: [{ file: "src/inngest.ts" }],
+            supportingEvidence: [
               `Inngest event '${prod.name}' is emitted but not handled.`,
               `Inngest event '${cons.name}' is handled but never emitted.`
-            ]
+            ],
+            contradictingEvidence: [],
+            confirmationExperiment: "Rename the event emission or the event listener trigger properties to match.",
+            confidence: 95,
+            status: "SUPPORTED"
           });
         }
       }
@@ -260,13 +290,16 @@ export class FailureLocalizer {
     const hasWebhookError = log.includes("Webhook Error") || log.includes("stripe-signature") || log.includes("signature verification failed") || log.includes("constructEvent");
     if (hasWebhookError) {
       list.push({
-        description: "Stripe webhook signature verification failure due to parsed req.body instead of raw buffer",
-        confidence: 90,
-        status: "SUPPORTED",
-        evidence: [
+        statement: "Stripe webhook signature verification failure due to parsed req.body instead of raw buffer",
+        sourceSymbols: [{ file: "src/stripe.ts" }],
+        supportingEvidence: [
           "Log contains Stripe signature verification failure: Webhook Error.",
           "Stripe constructEvent requires a raw buffer payload, but req.body was passed after JSON parsing."
-        ]
+        ],
+        contradictingEvidence: [],
+        confirmationExperiment: "Configure body-parser or use express.raw({ type: 'application/json' }) middleware on webhook route.",
+        confidence: 90,
+        status: "SUPPORTED"
       });
     }
 
@@ -274,13 +307,16 @@ export class FailureLocalizer {
     const hasClerkError = log.includes("verifySession") || log.includes("Bearer sess_") || log.includes("Authorization header") || log.includes("Auth Verification Failed");
     if (hasClerkError) {
       list.push({
-        description: "Clerk authentication token verification failed due to missing Bearer prefix stripping",
-        confidence: 90,
-        status: "SUPPORTED",
-        evidence: [
+        statement: "Clerk authentication token verification failed due to missing Bearer prefix stripping",
+        sourceSymbols: [{ file: "src/clerk.ts" }],
+        supportingEvidence: [
           "Authorization token verification failed on Clerk.",
           "Authorization token has Bearer prefix but verification expected stripped token."
-        ]
+        ],
+        contradictingEvidence: [],
+        confirmationExperiment: "Update authorization header extraction to split by Bearer and strip prefix before verification.",
+        confidence: 90,
+        status: "SUPPORTED"
       });
     }
 
@@ -305,7 +341,7 @@ export class FailureLocalizer {
           await prisma.hypothesis.create({
             data: {
               agentRunId: agentRun.id,
-              description: h.description,
+              description: h.statement,
               confidence: h.confidence,
               status: h.status
             }

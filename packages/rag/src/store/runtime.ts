@@ -39,7 +39,7 @@ export class RuntimeStore {
       if (dbBoundaries.length > 0) {
         summaryLines.push("#### Localized Failure Boundaries:");
         for (const boundary of dbBoundaries) {
-          summaryLines.push(`- **Failed Stage**: \`${boundary.failedStage}\` - **Reason**: ${boundary.reason}`);
+          summaryLines.push(`- **Failed Stage**: \`${boundary.failedStage}\` - **Reason**: ${boundary.reason} (Artifact: failureBoundary/\`${boundary.id}\`)`);
         }
       }
 
@@ -47,7 +47,7 @@ export class RuntimeStore {
       if (failedSteps.length > 0) {
         summaryLines.push("\n#### Failed Workflow Steps & Logs:");
         for (const run of failedSteps.slice(0, limit)) {
-          summaryLines.push(`- **Step Run ID**: \`${run.id}\` (Status: \`${run.status}\`)`);
+          summaryLines.push(`- **Step Run ID**: \`${run.id}\` (Status: \`${run.status}\`) (Artifact: workflowStepRun/\`${run.id}\`)`);
           if (run.error) {
             summaryLines.push(`  - **Error**: \`${run.error}\``);
           }
@@ -80,7 +80,7 @@ export class RuntimeStore {
         summaryLines.push("\n#### Incident Event Timeline:");
         for (const evt of matchedEvents.slice(0, limit * 2)) {
           summaryLines.push(
-            `- [${evt.timestamp.toISOString()}] [${evt.type.toUpperCase()}] ${evt.message}`
+            `- [${evt.timestamp.toISOString()}] [${evt.type.toUpperCase()}] ${evt.message} (Artifact: incidentEvent/\`${evt.id}\`)`
           );
         }
       }

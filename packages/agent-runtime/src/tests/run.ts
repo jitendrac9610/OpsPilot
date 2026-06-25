@@ -1,4 +1,11 @@
 import assert from "node:assert";
+import dotenv from "dotenv";
+import path from "node:path";
+
+dotenv.config({ path: path.resolve(__dirname, "../../../../.env") });
+process.env.NODE_ENV = "test";
+
+import { prisma } from "@opspilot/database";
 import { AgentStateMachine } from "../stateMachine.js";
 import { BudgetController } from "../budget.js";
 import { Planner } from "../planner.js";
@@ -202,6 +209,144 @@ async function runTests() {
     const finalState = await orchestrator.run();
     assert.strictEqual(finalState, "COMPLETED");
     console.log("✓ E2E Orchestrator Loop tests passed.");
+  }
+
+  console.log("\n8. Testing Phase 15: Agent Orchestrator safeguards...");
+  {
+    // Clean up any potential leftovers from previous runs
+    await prisma.graphNode.deleteMany({ where: { id: { startsWith: "p15-prisma-node" } } }).catch(() => {});
+
+    // (a) Test dynamic repository-specific planning
+    const org = await prisma.organization.create({ data: { name: "Phase 15 Test Org" } }).catch(() => null);
+    let project: any;
+    let repo: any;
+    let snapshot: any;
+    let archVersion: any;
+    
+    if (org) {
+      project = await prisma.project.create({ data: { organizationId: org.id, name: "Phase 15 Project" } });
+      repo = await prisma.repository.create({ data: { projectId: project.id, name: "phase15-repo", gitUrl: "mock-url" } });
+      snapshot = await prisma.repositorySnapshot.create({ data: { repositoryId: repo.id, commitSha: "commit-15", archiveUrl: "mock-archive" } });
+      archVersion = await prisma.architectureVersion.create({ data: { snapshotId: snapshot.id } });
+      await prisma.graphNode.create({
+        data: { id: `p15-prisma-node-${Math.random().toString(36).substring(2, 9)}`, versionId: archVersion.id, type: "database", name: "prisma", metadata: {} }
+      });
+    }
+
+    const orchestrator = new AgentOrchestrator({
+      goal: "Test custom repository planning",
+      snapshotId: snapshot?.id || "mock-snapshot-id"
+    });
+    await orchestrator.initializeRun();
+    const steps = orchestrator.planner.getSteps();
+    if (org) {
+      assert.ok(steps.some(s => s.description.includes("Prisma Database")), "Expected repository-specific customized planning step");
+    }
+
+    // (b) Test state transition safeguards: loop detection
+    const loopOrchestrator = new AgentOrchestrator({
+      goal: "Test loop detection",
+      isProduction: false
+    });
+    
+    const repeatedDecision: AgentDecision = { type: "call_tool", tool: "unknown-tool", arguments: {} };
+    loopOrchestrator.modelGateway.setMockDecisions([repeatedDecision, repeatedDecision, repeatedDecision]);
+    
+    loopOrchestrator.toolRegistry.register({
+      name: "unknown-tool",
+      description: "mock tool",
+      parameters: {},
+      handler: async () => ({ success: true, output: "ok" })
+    });
+    
+    try {
+      await loopOrchestrator.step();
+    } catch (e) {}
+    assert.strictEqual(loopOrchestrator.stateMachine.getState(), "NEEDS_HUMAN");
+
+    // Reset loop checks
+    const loopOrchestrator2 = new AgentOrchestrator({
+      goal: "Test loop detection 2",
+      isProduction: false
+    });
+    loopOrchestrator2.stateMachine.transitionTo("DISCOVERING");
+    loopOrchestrator2.stateMachine.transitionTo("PLANNING");
+    
+    const retrieveLoopDec: AgentDecision = { type: "retrieve", request: { query: "test" } };
+    loopOrchestrator2.modelGateway.setMockDecisions([retrieveLoopDec, retrieveLoopDec, retrieveLoopDec]);
+    
+    await loopOrchestrator2.step();
+    assert.strictEqual(loopOrchestrator2.stateMachine.getState(), "RETRIEVING");
+
+    await loopOrchestrator2.step();
+    assert.strictEqual(loopOrchestrator2.stateMachine.getState(), "INVESTIGATING");
+
+    await loopOrchestrator2.step();
+    assert.strictEqual(loopOrchestrator2.stateMachine.getState(), "NEEDS_HUMAN");
+    assert.ok(loopOrchestrator2.evidenceManager.getMissingEvidence()[0].includes("Repeated action"), "Expected repeated action loop error message");
+
+    // (c) Test maximum state dwell limit
+    const dwellOrchestrator = new AgentOrchestrator({
+      goal: "Test state dwell",
+      isProduction: false
+    });
+    dwellOrchestrator.modelGateway.setMockDecisions([
+      { type: "retrieve", request: { query: "test-1" } },
+      { type: "retrieve", request: { query: "test-2" } },
+      { type: "retrieve", request: { query: "test-3" } },
+      { type: "retrieve", request: { query: "test-4" } },
+      { type: "retrieve", request: { query: "test-5" } },
+      { type: "retrieve", request: { query: "test-6" } }
+    ]);
+    
+    for (let i = 0; i < 5; i++) {
+      await dwellOrchestrator.step();
+      assert.strictEqual(dwellOrchestrator.stateMachine.getState(), "CREATED");
+    }
+    await dwellOrchestrator.step();
+    assert.strictEqual(dwellOrchestrator.stateMachine.getState(), "NEEDS_HUMAN");
+    assert.ok(dwellOrchestrator.evidenceManager.getMissingEvidence()[0].includes("dwell time limit exceeded"), "Expected dwell time limit error message");
+
+    // (d) Test dynamic retrieval execution
+    const retrieveOrchestrator = new AgentOrchestrator({
+      goal: "Test dynamic RAG retrieval",
+      snapshotId: "snap-123"
+    });
+    (retrieveOrchestrator as any).rag = {
+      retrieveHybridContext: async (q: string) => ({ fullContextText: `Context for query: ${q}` })
+    };
+    
+    const retrieveDec: AgentDecision = { type: "retrieve", request: { query: "DB latency" } };
+    retrieveOrchestrator.modelGateway.setMockDecisions([retrieveDec]);
+    await retrieveOrchestrator.step();
+    assert.ok((retrieveOrchestrator as any).extraRetrievalContexts.includes("Context for query: DB latency"));
+
+    // (e) Test simulation labeling
+    const simOrchestrator = new AgentOrchestrator({
+      goal: "Test simulation label",
+      isProduction: false
+    });
+    simOrchestrator.toolRegistry.register({
+      name: "list_services",
+      description: "mock list_services tool",
+      parameters: {},
+      handler: async () => ({ success: true, output: "ok" })
+    });
+    simOrchestrator.modelGateway.setMockDecisions([{ type: "call_tool", tool: "list_services", arguments: {} }]);
+    const stepRes = await simOrchestrator.step();
+    assert.strictEqual(stepRes.decision.simulated, true, "Expected decision to be marked as simulated");
+
+    // Clean up DB mock records
+    if (org) {
+      await prisma.graphNode.deleteMany({ where: { versionId: archVersion.id } }).catch(() => {});
+      await prisma.architectureVersion.delete({ where: { id: archVersion.id } }).catch(() => {});
+      await prisma.repositorySnapshot.delete({ where: { id: snapshot.id } }).catch(() => {});
+      await prisma.repository.delete({ where: { id: repo.id } }).catch(() => {});
+      await prisma.project.delete({ where: { id: project.id } }).catch(() => {});
+      await prisma.organization.delete({ where: { id: org.id } }).catch(() => {});
+    }
+
+    console.log("✓ Phase 15 Agent Orchestrator safeguards and features verified.");
   }
 
   console.log("\nALL TESTS PASSED SUCCESSFULLY!");

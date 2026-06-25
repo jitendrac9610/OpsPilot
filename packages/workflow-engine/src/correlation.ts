@@ -1,5 +1,6 @@
 import { prisma } from "@opspilot/database";
 import { logger } from "@opspilot/shared";
+import { EvidenceEvent } from "@opspilot/schemas";
 
 export interface TraceEvent {
   timestamp: string;
@@ -153,6 +154,43 @@ export class CorrelationManager {
       } catch (err: any) {
         logger.warn({ err }, "Database workflowRun update failed.");
       }
+    }
+  }
+
+  public async recordEvidenceEvent(runId: string, event: EvidenceEvent) {
+    logger.info({ runId, eventId: event.id }, "Recording EvidenceEvent");
+    if (!this.dbFallback) {
+      try {
+        const run = await prisma.diagnosticRun.findUnique({
+          where: { id: runId }
+        });
+        if (run) {
+          const artifacts = (run.artifacts as any) || {};
+          const events = artifacts.evidenceEvents || [];
+          events.push(event);
+          artifacts.evidenceEvents = events;
+          await prisma.diagnosticRun.update({
+            where: { id: runId },
+            data: { artifacts }
+          });
+        }
+      } catch (err: any) {
+        logger.warn({ err }, "Database recordEvidenceEvent failed");
+      }
+    }
+  }
+
+  public async getEvidenceTimeline(runId: string): Promise<EvidenceEvent[]> {
+    if (this.dbFallback) return [];
+    try {
+      const run = await prisma.diagnosticRun.findUnique({
+        where: { id: runId }
+      });
+      const artifacts = (run?.artifacts as any) || {};
+      const events = (artifacts.evidenceEvents || []) as EvidenceEvent[];
+      return events.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    } catch {
+      return [];
     }
   }
 }

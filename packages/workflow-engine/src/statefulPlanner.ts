@@ -1,7 +1,11 @@
 import {
   Assertion,
   EndpointContract,
-  WorkflowStep
+  WorkflowStep,
+  WebSocketContract,
+  WebhookContract,
+  QueueContract,
+  BrowserContract
 } from "@opspilot/schemas";
 import crypto from "node:crypto";
 import { AuthBootstrapper } from "./authBootstrapper.js";
@@ -48,7 +52,11 @@ export class StatefulWorkflowPlanner {
 
   public async planWorkflow(
     projectId: string,
-    contracts: EndpointContract[]
+    contracts: EndpointContract[],
+    wsContracts: WebSocketContract[] = [],
+    webhookContracts: WebhookContract[] = [],
+    queueContracts: QueueContract[] = [],
+    browserContracts: BrowserContract[] = []
   ): Promise<SyntheticWorkflowPlan> {
     const steps: WorkflowStep[] = [];
     const cleanupSteps: WorkflowStep[] = [];
@@ -96,6 +104,254 @@ export class StatefulWorkflowPlanner {
         };
         createSteps.set(lifecycle.name, createId);
         previousSteps = [createId];
+
+        // WebSocket integration
+        for (const wsContract of wsContracts) {
+          for (const event of wsContract.events) {
+            if (
+              shareSignificantWord(lifecycle.name, event.name) ||
+              shareSignificantWord(createContract.path, event.name)
+            ) {
+              let currentPrevious = createId;
+
+              // Join room first if rooms exist
+              if (event.rooms && event.rooms.length > 0) {
+                const roomName = resolveRoomTemplate(event.rooms[0], lifecycle.name);
+                const joinStepId = `step-${stepCounter++}`;
+                steps.push({
+                  id: joinStepId,
+                  name: `Join WebSocket Room: ${roomName}`,
+                  type: "WEBSOCKET_OPEN",
+                  config: {
+                    url: wsContract.url || "ws://localhost:4000",
+                    namespace: wsContract.namespaces[0],
+                    action: "join_room",
+                    room: roomName,
+                    dependsOn: [currentPrevious]
+                  },
+                  assertions: []
+                });
+                prerequisiteGraph[joinStepId] = [currentPrevious];
+                currentPrevious = joinStepId;
+              }
+
+              // Listen or Emit event
+              if (event.direction === "server-to-client") {
+                const listenStepId = `step-${stepCounter++}`;
+                steps.push({
+                  id: listenStepId,
+                  name: `Listen for WebSocket Event: ${event.name}`,
+                  type: "WEBSOCKET_OPEN",
+                  config: {
+                    url: wsContract.url || "ws://localhost:4000",
+                    namespace: wsContract.namespaces[0],
+                    action: "listen",
+                    event: event.name,
+                    timeoutMs: 5000,
+                    dependsOn: [currentPrevious]
+                  },
+                  assertions: []
+                });
+                prerequisiteGraph[listenStepId] = [currentPrevious];
+                currentPrevious = listenStepId;
+              } else if (event.direction === "client-to-server") {
+                const emitStepId = `step-${stepCounter++}`;
+                steps.push({
+                  id: emitStepId,
+                  name: `Emit WebSocket Event: ${event.name}`,
+                  type: "WEBSOCKET_OPEN",
+                  config: {
+                    url: wsContract.url || "ws://localhost:4000",
+                    namespace: wsContract.namespaces[0],
+                    action: "emit",
+                    event: event.name,
+                    payload: {},
+                    dependsOn: [currentPrevious]
+                  },
+                  assertions: []
+                });
+                prerequisiteGraph[emitStepId] = [currentPrevious];
+                currentPrevious = emitStepId;
+              }
+
+              previousSteps = [currentPrevious];
+            }
+          }
+        }
+
+        // Webhook integration
+        for (const webhookContract of webhookContracts) {
+          if (isWebhookRelevant(lifecycle.name, createContract.path, webhookContract)) {
+            let currentPrevious = previousSteps[0] || createId;
+            const event = webhookContract.eventTypes[0] || "custom_event";
+
+            const payload: Record<string, any> = {
+              id: `evt_test_${crypto.randomBytes(4).toString("hex")}`,
+              type: event,
+              data: {
+                object: {
+                  id: `\${${lifecycle.name}.id}`,
+                  amount: 1000,
+                  currency: "usd"
+                }
+              }
+            };
+
+            if (webhookContract.provider === "github") {
+              payload.action = "completed";
+              payload.repository = { name: projectId };
+              payload.sender = { login: "opspilot-tester" };
+            }
+
+            const webhookStepId = `step-${stepCounter++}`;
+            steps.push({
+              id: webhookStepId,
+              name: `Simulate Webhook: ${webhookContract.provider} - ${event}`,
+              type: "SIMULATE_WEBHOOK",
+              config: {
+                type: "incoming",
+                endpointUrl: `\${baseApiUrl}${webhookContract.endpointUrl}`,
+                provider: webhookContract.provider,
+                secret: `\${process.env.${webhookContract.signingSecretEnvVar || "STRIPE_WEBHOOK_SECRET"}}`,
+                payload,
+                dependsOn: [currentPrevious]
+              },
+              assertions: []
+            });
+
+            prerequisiteGraph[webhookStepId] = [currentPrevious];
+            currentPrevious = webhookStepId;
+            previousSteps = [currentPrevious];
+          }
+        }
+
+        // Queue/Worker integration
+        for (const queueContract of queueContracts) {
+          if (
+            shareSignificantWord(lifecycle.name, queueContract.name) ||
+            shareSignificantWord(createContract.path, queueContract.name)
+          ) {
+            let currentPrevious = previousSteps[0] || createId;
+            const singularName = singular(lifecycle.name);
+            const idVar = `\${${lifecycle.name}.id}`;
+            const payloadContains: Record<string, any> = {
+              [`${singularName}Id`]: idVar
+            };
+
+            const queueStepId = `step-${stepCounter++}`;
+            steps.push({
+              id: queueStepId,
+              name: `Wait for BullMQ Job: ${queueContract.name}`,
+              type: "WAIT_FOR_JOB",
+              config: {
+                queueName: queueContract.name,
+                state: "completed",
+                payloadContains,
+                dependsOn: [currentPrevious]
+              },
+              assertions: []
+            });
+
+            prerequisiteGraph[queueStepId] = [currentPrevious];
+            currentPrevious = queueStepId;
+            previousSteps = [currentPrevious];
+          }
+        }
+
+        // Browser integration
+        for (const browserContract of browserContracts) {
+          if (
+            shareSignificantWord(lifecycle.name, browserContract.path) ||
+            shareSignificantWord(createContract.path, browserContract.path)
+          ) {
+            let currentPrevious = previousSteps[0] || createId;
+
+            // 1. Navigate to the page
+            const navStepId = `step-${stepCounter++}`;
+            steps.push({
+              id: navStepId,
+              name: `Navigate to ${browserContract.path}`,
+              type: "BROWSER_ACTION",
+              config: {
+                action: "navigate",
+                url: browserContract.path,
+                dependsOn: [currentPrevious]
+              },
+              assertions: []
+            });
+            prerequisiteGraph[navStepId] = [currentPrevious];
+            currentPrevious = navStepId;
+
+            // 2. Interact with inputs, selects, checkboxes, buttons
+            for (const element of browserContract.elements) {
+              if (element.type === "input") {
+                const fillStepId = `step-${stepCounter++}`;
+                steps.push({
+                  id: fillStepId,
+                  name: `Fill ${element.name || "input"} on ${browserContract.path}`,
+                  type: "BROWSER_ACTION",
+                  config: {
+                    action: "fill",
+                    selector: element.selector,
+                    text: `test-${element.name || "input"}`,
+                    dependsOn: [currentPrevious]
+                  },
+                  assertions: []
+                });
+                prerequisiteGraph[fillStepId] = [currentPrevious];
+                currentPrevious = fillStepId;
+              } else if (element.type === "select") {
+                const selectStepId = `step-${stepCounter++}`;
+                steps.push({
+                  id: selectStepId,
+                  name: `Select option in ${element.name || "select"} on ${browserContract.path}`,
+                  type: "BROWSER_ACTION",
+                  config: {
+                    action: "select",
+                    selector: element.selector,
+                    value: "1",
+                    dependsOn: [currentPrevious]
+                  },
+                  assertions: []
+                });
+                prerequisiteGraph[selectStepId] = [currentPrevious];
+                currentPrevious = selectStepId;
+              } else if (element.type === "checkbox") {
+                const checkStepId = `step-${stepCounter++}`;
+                steps.push({
+                  id: checkStepId,
+                  name: `Check checkbox in ${element.name || "checkbox"} on ${browserContract.path}`,
+                  type: "BROWSER_ACTION",
+                  config: {
+                    action: "check",
+                    selector: element.selector,
+                    dependsOn: [currentPrevious]
+                  },
+                  assertions: []
+                });
+                prerequisiteGraph[checkStepId] = [currentPrevious];
+                currentPrevious = checkStepId;
+              } else if (element.type === "button") {
+                const clickStepId = `step-${stepCounter++}`;
+                steps.push({
+                  id: clickStepId,
+                  name: `Click ${element.label || "button"} on ${browserContract.path}`,
+                  type: "BROWSER_ACTION",
+                  config: {
+                    action: "click",
+                    selector: element.selector,
+                    dependsOn: [currentPrevious]
+                  },
+                  assertions: []
+                });
+                prerequisiteGraph[clickStepId] = [currentPrevious];
+                currentPrevious = clickStepId;
+              }
+            }
+
+            previousSteps = [currentPrevious];
+          }
+        }
 
         const negativeSteps = this.requestGenerator
           .generateRequestSuite(createContract, {
@@ -587,3 +843,51 @@ function safeId(value: string): string {
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+function shareSignificantWord(a: string, b: string): boolean {
+  const clean = (str: string) => str.toLowerCase().replace(/[^a-z0-9]/g, " ").split(/\s+/).filter(w => w.length >= 4);
+  const wordsA = clean(a);
+  const wordsB = clean(b);
+  for (const wA of wordsA) {
+    for (const wB of wordsB) {
+      if (wA === wB || wA + "s" === wB || wB + "s" === wA || wA.slice(0, -1) === wB || wB.slice(0, -1) === wA) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function resolveRoomTemplate(room: string, resourceName: string): string {
+  const match = room.match(/\d+/);
+  if (match) {
+    return room.replace(/\d+/, `\${${resourceName}.id}`);
+  }
+  return room;
+}
+
+function isWebhookRelevant(lifecycleName: string, createPath: string, webhook: WebhookContract): boolean {
+  if (
+    shareSignificantWord(lifecycleName, webhook.provider) ||
+    shareSignificantWord(lifecycleName, webhook.endpointUrl) ||
+    shareSignificantWord(createPath, webhook.endpointUrl)
+  ) {
+    return true;
+  }
+
+  const nameLower = lifecycleName.toLowerCase();
+  const pathLower = createPath.toLowerCase();
+
+  if (webhook.provider === "stripe" || webhook.provider === "razorpay") {
+    const paymentKeywords = ["order", "payment", "checkout", "subscription", "billing", "invoice", "customer", "charge"];
+    return paymentKeywords.some(keyword => nameLower.includes(keyword) || pathLower.includes(keyword));
+  }
+
+  if (webhook.provider === "github") {
+    const githubKeywords = ["repo", "repository", "commit", "pull", "issue", "project", "build", "deploy", "workflow"];
+    return githubKeywords.some(keyword => nameLower.includes(keyword) || pathLower.includes(keyword));
+  }
+
+  return false;
+}
+

@@ -7,3 +7,7 @@ export * from "./authBootstrapper.js";
 export * from "./requestGenerator.js";
 export * from "./statefulPlanner.js";
 export * from "./diagnosticOrchestrator.js";
+export * from "./queueDiscovery.js";
+export * from "./browserDiscovery.js";
+
+

@@ -32,18 +32,18 @@ export class ModelGateway {
     // Check if we should run in mock mode
     if (opts?.mockDecisions && opts.mockDecisions.length > 0) {
       const decision = opts.mockDecisions.shift()!;
-      return { decision, promptTokens: 0, completionTokens: 0 };
+      return { decision: { ...decision, simulated: true }, promptTokens: 0, completionTokens: 0 };
     }
     if (this.mockQueue.length > 0) {
       const decision = this.mockQueue.shift()!;
-      return { decision, promptTokens: 0, completionTokens: 0 };
+      return { decision: { ...decision, simulated: true }, promptTokens: 0, completionTokens: 0 };
     }
 
     if (!this.apiKey) {
       if (config.isDemoMode) {
         logger.warn(`ModelGateway: No API key configured for ${this.provider}; using clearly marked demo decisions.`);
         const decision = this.getMockDecisionForState(state);
-        return { decision, promptTokens: 0, completionTokens: 0 };
+        return { decision: { ...decision, simulated: true }, promptTokens: 0, completionTokens: 0 };
       }
       throw new Error(`MODEL_PROVIDER_NOT_CONFIGURED: No API key configured for ${this.provider}.`);
     }
