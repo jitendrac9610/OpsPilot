@@ -65,6 +65,72 @@ function verifyGithubSignature(req: Request): boolean {
   }
 }
 
+async function findRepositoryForGitHubId(githubRepositoryId: string) {
+  return prisma.repository.findFirst({
+    where: {
+      OR: [
+        { githubRepositoryId },
+        { id: githubRepositoryId }
+      ]
+    },
+    include: {
+      project: true,
+      githubInstallation: true
+    }
+  });
+}
+
+function installationMetadata(payload: any) {
+  const account = payload.installation?.account || {};
+  return {
+    accountLogin: String(account.login || "unknown"),
+    accountType: String(account.type || "unknown"),
+    permissions: payload.installation?.permissions || {}
+  };
+}
+
+async function upsertInstallationForRepository(
+  dbRepo: Awaited<ReturnType<typeof findRepositoryForGitHubId>>,
+  payload: any,
+  installationId: string
+) {
+  if (!dbRepo) throw new Error("Repository is required to upsert GitHub installation");
+  const metadata = installationMetadata(payload);
+  return prisma.gitHubInstallation.upsert({
+    where: { installationId },
+    update: {
+      ...metadata,
+      suspendedAt: null
+    },
+    create: {
+      organizationId: dbRepo.project.organizationId,
+      installationId,
+      ...metadata
+    }
+  });
+}
+
+async function linkRepositoryToInstallation(
+  dbRepo: Awaited<ReturnType<typeof findRepositoryForGitHubId>>,
+  repoPayload: any,
+  installationId: string,
+  payload: any
+) {
+  if (!dbRepo) return null;
+  const installation = await upsertInstallationForRepository(dbRepo, payload, installationId);
+  await prisma.repository.update({
+    where: { id: dbRepo.id },
+    data: {
+      githubInstallationId: installation.id,
+      githubRepositoryId: String(repoPayload.id),
+      githubFullName: repoPayload.full_name || null,
+      name: repoPayload.name || dbRepo.name,
+      branch: repoPayload.default_branch || dbRepo.branch
+    }
+  });
+  return installation;
+}
+
 // POST /webhooks/github
 app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunction) => {
   // 1. Verify GitHub Signature
@@ -118,10 +184,7 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
         const repositoryId = payload.repository?.id ? String(payload.repository.id) : null;
         const branch = payload.ref ? payload.ref.replace("refs/heads/", "") : "main";
         if (repositoryId) {
-          const dbRepo = await prisma.repository.findUnique({
-            where: { id: repositoryId },
-            include: { project: true }
-          });
+          const dbRepo = await findRepositoryForGitHubId(repositoryId);
           if (dbRepo) {
             await prisma.auditLog.create({
               data: {
@@ -142,10 +205,7 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
         return res.status(400).json({ error: "BAD_REQUEST", message: "Missing repository ID" });
       }
 
-      const dbRepo = await prisma.repository.findUnique({
-        where: { id: repositoryId },
-        include: { project: true }
-      });
+      const dbRepo = await findRepositoryForGitHubId(repositoryId);
       if (!dbRepo) {
         logger.warn({ repositoryId }, "Repository not found in database");
         return res.status(404).json({ error: "NOT_FOUND", message: "Repository not found in database" });
@@ -157,10 +217,8 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
       }
 
       // Validate scope / installation mapping
-      const githubInstall = await prisma.gitHubInstallation.findUnique({
-        where: { repositoryId }
-      });
-      if (!githubInstall || githubInstall.installationId !== installationId) {
+      const githubInstall = dbRepo.githubInstallation;
+      if (!githubInstall || githubInstall.installationId !== installationId || githubInstall.suspendedAt) {
         logger.warn({ repositoryId, installationId }, "Repository installation scope mismatch or unauthorized installation");
         return res.status(403).json({ error: "UNAUTHORIZED_INSTALLATION", message: "Repository installation scope mismatch" });
       }
@@ -205,16 +263,9 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
         const repos = payload.repositories || [];
         for (const repo of repos) {
           const repositoryId = String(repo.id);
-          const dbRepo = await prisma.repository.findUnique({
-            where: { id: repositoryId },
-            include: { project: true }
-          });
+          const dbRepo = await findRepositoryForGitHubId(repositoryId);
           if (dbRepo) {
-            await prisma.gitHubInstallation.upsert({
-              where: { repositoryId },
-              update: { installationId },
-              create: { repositoryId, installationId }
-            });
+            await linkRepositoryToInstallation(dbRepo, repo, installationId, payload);
 
             await prisma.auditLog.create({
               data: {
@@ -238,22 +289,37 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
       if (action === "deleted" || action === "suspend") {
         const installations = await prisma.gitHubInstallation.findMany({
           where: { installationId },
-          include: { repository: { include: { project: true } } }
+          include: { repositories: { include: { project: true } } }
         });
         for (const inst of installations) {
-          await prisma.gitHubInstallation.delete({
-            where: { id: inst.id }
-          });
-          await prisma.auditLog.create({
-            data: {
-              orgId: inst.repository.project.organizationId,
-              action: action === "deleted" ? "github.installation.deleted" : "github.installation.suspended",
-              payload: {
-                repositoryId: inst.repositoryId,
-                installationId
+          if (action === "suspend") {
+            await prisma.gitHubInstallation.update({
+              where: { id: inst.id },
+              data: { suspendedAt: new Date() }
+            });
+          } else {
+            await prisma.repository.updateMany({
+              where: { githubInstallationId: inst.id },
+              data: { githubInstallationId: null }
+            });
+            await prisma.gitHubInstallation.delete({
+              where: { id: inst.id }
+            });
+          }
+
+          for (const repository of inst.repositories) {
+            await prisma.auditLog.create({
+              data: {
+                orgId: repository.project.organizationId,
+                action: action === "deleted" ? "github.installation.deleted" : "github.installation.suspended",
+                payload: {
+                  repositoryId: repository.id,
+                  githubRepositoryId: repository.githubRepositoryId,
+                  installationId
+                }
               }
-            }
-          });
+            });
+          }
         }
         return res.status(200).json({
           status: action === "deleted" ? "installation_deleted_processed" : "installation_suspended_processed",
@@ -279,16 +345,9 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
         const added = payload.repositories_added || [];
         for (const repo of added) {
           const repositoryId = String(repo.id);
-          const dbRepo = await prisma.repository.findUnique({
-            where: { id: repositoryId },
-            include: { project: true }
-          });
+          const dbRepo = await findRepositoryForGitHubId(repositoryId);
           if (dbRepo) {
-            await prisma.gitHubInstallation.upsert({
-              where: { repositoryId },
-              update: { installationId },
-              create: { repositoryId, installationId }
-            });
+            await linkRepositoryToInstallation(dbRepo, repo, installationId, payload);
             await prisma.auditLog.create({
               data: {
                 orgId: dbRepo.project.organizationId,
@@ -309,13 +368,16 @@ app.post("/webhooks/github", async (req: Request, res: Response, next: NextFunct
         const removed = payload.repositories_removed || [];
         for (const repo of removed) {
           const repositoryId = String(repo.id);
-          const dbRepo = await prisma.repository.findUnique({
-            where: { id: repositoryId },
-            include: { project: true }
-          });
+          const dbRepo = await findRepositoryForGitHubId(repositoryId);
           if (dbRepo) {
-            await prisma.gitHubInstallation.deleteMany({
-              where: { repositoryId, installationId }
+            await prisma.repository.updateMany({
+              where: {
+                id: dbRepo.id,
+                githubInstallation: { installationId }
+              },
+              data: {
+                githubInstallationId: null
+              }
             });
             await prisma.auditLog.create({
               data: {

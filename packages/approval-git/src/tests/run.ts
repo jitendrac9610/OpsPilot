@@ -26,7 +26,7 @@ async function runTests() {
   assert.strictEqual(prInfo.success, true);
   assert(prInfo.prId.startsWith("pr-"));
   assert(prInfo.url.includes("demo-repo/pull"));
-  assert(prInfo.number >= 100);
+  assert.strictEqual(prInfo.number, 42);
   console.log("✓ PR created and registered.");
 
   console.log("\n3. Testing Audit Logging...");

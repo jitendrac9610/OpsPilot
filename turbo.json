@@ -1,5 +1,24 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "globalDotEnv": [".env"],
+  "globalPassThroughEnv": [
+    "DATABASE_URL",
+    "REDIS_URL",
+    "NODE_ENV",
+    "PORT",
+    "JWT_SECRET",
+    "CLIENT_URL",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GITHUB_APP_ID",
+    "GITHUB_PRIVATE_KEY",
+    "GITHUB_WEBHOOK_SECRET",
+    "GITHUB_CLIENT_ID",
+    "GITHUB_CLIENT_SECRET",
+    "OTEL_EXPORTER_OTLP_ENDPOINT"
+  ],
   "pipeline": {
     "build": {
       "dependsOn": ["^build"],

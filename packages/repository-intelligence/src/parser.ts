@@ -561,8 +561,23 @@ export function parseFile(language: string, relativePath: string, absolutePath: 
   }
 
   // 4. Generate Semantic Code Chunks
-  // Sort symbols by startLine
-  const sortedSymbols = [...symbols].sort((a, b) => a.startLine - b.startLine);
+  // Filter top-level symbols for chunking to avoid overlapping/duplicated chunks
+  const topLevelSymbols = symbols.filter(sym => {
+    return !symbols.some(other => {
+      if (other === sym) return false;
+      const encloses = other.startLine <= sym.startLine && other.endLine >= sym.endLine;
+      if (encloses) {
+        if (other.startLine === sym.startLine && other.endLine === sym.endLine) {
+          return symbols.indexOf(other) < symbols.indexOf(sym);
+        }
+        return true;
+      }
+      return false;
+    });
+  });
+
+  // Sort top-level symbols by startLine
+  const sortedSymbols = [...topLevelSymbols].sort((a, b) => a.startLine - b.startLine);
   let currentLine = 1;
 
   for (const sym of sortedSymbols) {

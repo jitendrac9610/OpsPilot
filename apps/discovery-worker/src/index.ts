@@ -119,17 +119,7 @@ app.post("/discover", async (req: Request, res: Response, next: NextFunction) =>
       }
     });
 
-    // Trigger Indexer Worker asynchronously
-    const indexerUrl = config.services.indexerWorkerUrl || "http://localhost:4003";
-    fetch(`${indexerUrl}/index`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        repositoryId,
-        commitSha,
-        archiveUrl
-      })
-    }).catch(err => logger.error({ err }, "Failed to trigger indexer-worker"));
+
 
     res.status(200).json({ status: "success", detections, profile });
   } catch (err) {

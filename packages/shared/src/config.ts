@@ -60,6 +60,7 @@ export const config = {
   
   github: {
     appId: process.env.GITHUB_APP_ID || "",
+    appSlug: process.env.GITHUB_APP_SLUG || "",
     privateKey: process.env.GITHUB_PRIVATE_KEY || "",
     webhookSecret: process.env.GITHUB_WEBHOOK_SECRET || "",
     clientId: process.env.GITHUB_CLIENT_ID || "",

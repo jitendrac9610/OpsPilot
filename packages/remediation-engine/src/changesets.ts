@@ -10,7 +10,7 @@ export class ChangeSetManager {
 
   public async createChangeSet(
     remediationPlanId: string,
-    files: { path: string; diff: string }[]
+    files: { path: string; diff: string; originalHash?: string }[]
   ): Promise<{ changeSetId: string; branchName: string }> {
     const branchName = `opspilot-fix-${Math.random().toString(36).substring(2, 9)}`;
     logger.info({ remediationPlanId, branchName }, "Creating remediation changeset and branch");
@@ -40,7 +40,8 @@ export class ChangeSetManager {
             data: {
               changeSetId,
               path: file.path,
-              diff: file.diff
+              diff: file.diff,
+              originalHash: file.originalHash
             }
           });
         }

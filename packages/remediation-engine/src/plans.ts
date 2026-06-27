@@ -44,8 +44,9 @@ export class RemediationPlanManager {
     }
 
     const alternatives = [
-      "Alternative A: Modify configuration files in env variables",
-      "Alternative B: Wrap execution logic in try/catch block with retry intervals"
+      "Candidate A: minimal local fix backed by the localized source symbol",
+      "Candidate B: configuration fix when evidence points to runtime configuration",
+      "Candidate C: defensive architecture fix when the failure crosses service boundaries"
     ];
 
     if (!this.dbFallback) {

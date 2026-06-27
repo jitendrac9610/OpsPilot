@@ -1,0 +1,33 @@
+{
+  "name": "@opspilot/workflow-core",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "tsc --build --clean"
+  },
+  "dependencies": {
+    "@opspilot/database": "workspace:*",
+    "@opspilot/schemas": "workspace:*",
+    "@opspilot/shared": "workspace:*",
+    "bullmq": "^5.8.0",
+    "ioredis": "^5.11.1",
+    "mongodb": "^7.3.0",
+    "pg": "^8.22.0",
+    "playwright": "^1.61.0",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/pg": "^8.20.0",
+    "typescript": "^5.4.5"
+  }
+}

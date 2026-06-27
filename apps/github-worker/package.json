@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@opspilot/database": "workspace:*",
+    "@opspilot/repository-intelligence": "workspace:*",
     "@opspilot/shared": "workspace:*",
     "@opspilot/schemas": "workspace:*",
     "@opspilot/connector-github": "workspace:*",

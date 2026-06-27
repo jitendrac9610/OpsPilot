@@ -1,5 +1,6 @@
 import { Router, Response, NextFunction } from "express";
 import { prisma } from "@opspilot/database";
+import { createCommitSnapshot, resolveRemoteHeadSha } from "@opspilot/repository-intelligence";
 import { ValidationError, ForbiddenError, logger, storage, config } from "@opspilot/shared";
 import { authMiddleware, AuthenticatedRequest } from "../middleware/auth.js";
 import unzipper from "unzipper";
@@ -106,6 +107,15 @@ router.get("/:id/status", async (req: AuthenticatedRequest, res: Response, next:
 
     if (!latestSnapshot) {
       return res.status(200).json({ status: "UNINDEXED", latestCommit: null });
+    }
+
+    if (latestSnapshot.status === "FAILED") {
+      return res.status(200).json({
+        status: "FAILED",
+        latestCommit: latestSnapshot.commitSha,
+        indexedAt: latestSnapshot.createdAt,
+        error: latestSnapshot.errorMessage
+      });
     }
 
     const archVersion = await prisma.architectureVersion.findFirst({
@@ -300,24 +310,35 @@ router.post("/:id/index", async (req: AuthenticatedRequest, res: Response, next:
     });
     if (!membership) throw new ForbiddenError();
 
-    // Trigger mock webhook/indexing
-    const mockWebhookUrl = `http://localhost:4001/webhooks/github`;
-    
-    // Non-blocking trigger to github-worker
-    fetch(mockWebhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-github-event": "push"
-      },
-      body: JSON.stringify({
-        ref: `refs/heads/${repository.branch}`,
-        head_commit: { id: `manual_commit_${Date.now()}` },
-        repository: { id: repository.id, clone_url: repository.gitUrl }
-      })
-    }).catch(err => logger.error({ err }, "Failed to send manual push index trigger"));
+    const commitSha = await resolveRemoteHeadSha(repository.gitUrl, repository.branch);
+    const snapshot = await createCommitSnapshot({
+      repositoryId: repository.id,
+      gitUrl: repository.gitUrl,
+      commitSha,
+      branch: repository.branch,
+      source: "manual-index"
+    });
 
-    res.status(202).json({ status: "indexing_initiated" });
+    await prisma.auditLog.create({
+      data: {
+        orgId: repository.project.organizationId,
+        userId: req.user!.id,
+        action: "repository.index.snapshot_created",
+        payload: {
+          repositoryId: repository.id,
+          snapshotId: snapshot.snapshotId,
+          commitSha,
+          archiveHash: snapshot.archiveHash
+        }
+      }
+    });
+
+    res.status(202).json({
+      status: "indexing_initiated",
+      snapshotId: snapshot.snapshotId,
+      commitSha,
+      archiveHash: snapshot.archiveHash
+    });
   } catch (err) {
     next(err);
   }
@@ -423,6 +444,30 @@ router.post("/:id/diagnose", async (req: AuthenticatedRequest, res: Response, ne
     });
     if (!membership) throw new ForbiddenError();
 
+    const existingActiveRun = await prisma.diagnosticRun.findFirst({
+      where: {
+        repositoryId: id,
+        status: { in: ["PENDING", "RUNNING"] }
+      },
+      orderBy: { createdAt: "desc" }
+    });
+
+    if (existingActiveRun) {
+      const { enqueueDiagnosticRun } = await import("./diagnosticRuns.js");
+      await enqueueDiagnosticRun(existingActiveRun.id);
+
+      await prisma.auditLog.create({
+        data: {
+          orgId: repository.project.organizationId,
+          userId: req.user!.id,
+          action: "diagnostic_run.reuse",
+          payload: { repositoryId: id, diagnosticRunId: existingActiveRun.id }
+        }
+      });
+
+      return res.status(200).json(existingActiveRun);
+    }
+
     // Create DiagnosticRun in DB
     const diagnosticRun = await prisma.diagnosticRun.create({
       data: {
@@ -453,4 +498,3 @@ router.post("/:id/diagnose", async (req: AuthenticatedRequest, res: Response, ne
 });
 
 export const repositoryRouter: Router = router;
-

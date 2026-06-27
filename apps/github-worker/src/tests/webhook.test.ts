@@ -46,7 +46,8 @@ async function runWebhookTests() {
       projectId: project.id,
       name: "webhook-test-repo",
       gitUrl: "mock-repo-url",
-      branch: "main"
+      branch: "main",
+      githubRepositoryId: repositoryId
     }
   });
 
@@ -57,7 +58,8 @@ async function runWebhookTests() {
       projectId: project.id,
       name: "webhook-test-repo-2",
       gitUrl: "mock-repo-url-2",
-      branch: "main"
+      branch: "main",
+      githubRepositoryId: repositoryId2
     }
   });
 
@@ -147,10 +149,12 @@ async function runWebhookTests() {
 
     // Verify DB
     const installRecord = await prisma.gitHubInstallation.findUnique({
-      where: { repositoryId }
+      where: { installationId: "123456" },
+      include: { repositories: true }
     });
     assert.ok(installRecord);
     assert.strictEqual(installRecord.installationId, "123456");
+    assert.ok(installRecord.repositories.some(repo => repo.id === repositoryId));
 
     // Verify AuditLog
     const auditCreated = await prisma.auditLog.findFirst({
@@ -231,10 +235,12 @@ async function runWebhookTests() {
 
     // Verify DB
     const installRecord2 = await prisma.gitHubInstallation.findUnique({
-      where: { repositoryId: repositoryId2 }
+      where: { installationId: "123456" },
+      include: { repositories: true }
     });
     assert.ok(installRecord2);
     assert.strictEqual(installRecord2.installationId, "123456");
+    assert.ok(installRecord2.repositories.some(repo => repo.id === repositoryId2));
 
     // Verify AuditLog
     const auditAdded = await prisma.auditLog.findFirst({
@@ -271,10 +277,10 @@ async function runWebhookTests() {
     assert.strictEqual(data8.status, "repositories_removed_processed");
 
     // Verify DB removal
-    const removedRecord = await prisma.gitHubInstallation.findUnique({
-      where: { repositoryId: repositoryId2 }
+    const removedRecord = await prisma.repository.findUnique({
+      where: { id: repositoryId2 }
     });
-    assert.ok(!removedRecord);
+    assert.ok(!removedRecord?.githubInstallationId);
 
     // Verify AuditLog
     const auditRemoved = await prisma.auditLog.findFirst({
@@ -309,7 +315,7 @@ async function runWebhookTests() {
 
     // Verify DB removal of remaining installations
     const deletedRecord = await prisma.gitHubInstallation.findUnique({
-      where: { repositoryId }
+      where: { installationId: "123456" }
     });
     assert.ok(!deletedRecord);
 
@@ -379,8 +385,18 @@ async function runWebhookTests() {
     // 12. Handle installation.suspend event
     console.log("\n12. Testing installation.suspend lifecycle hook...");
     // Let's first create the installation mapping again
-    await prisma.gitHubInstallation.create({
-      data: { repositoryId, installationId: "123456" }
+    const manualInstallation = await prisma.gitHubInstallation.create({
+      data: {
+        organizationId: org.id,
+        installationId: "123456",
+        accountLogin: "webhook-test",
+        accountType: "Organization",
+        permissions: {}
+      }
+    });
+    await prisma.repository.update({
+      where: { id: repositoryId },
+      data: { githubInstallationId: manualInstallation.id }
     });
 
     const payload12 = {
@@ -404,9 +420,9 @@ async function runWebhookTests() {
     assert.strictEqual(data12.status, "installation_suspended_processed");
     // Verify DB removal
     const suspendedRecord = await prisma.gitHubInstallation.findUnique({
-      where: { repositoryId }
+      where: { installationId: "123456" }
     });
-    assert.ok(!suspendedRecord);
+    assert.ok(suspendedRecord?.suspendedAt);
     // Verify AuditLog
     const auditSuspended = await prisma.auditLog.findFirst({
       where: { orgId: org.id, action: "github.installation.suspended" }
@@ -440,10 +456,13 @@ async function runWebhookTests() {
     assert.strictEqual(data13.status, "installation_unsuspended_processed");
     // Verify DB restore
     const unsuspendedRecord = await prisma.gitHubInstallation.findUnique({
-      where: { repositoryId }
+      where: { installationId: "123456" },
+      include: { repositories: true }
     });
     assert.ok(unsuspendedRecord);
     assert.strictEqual(unsuspendedRecord.installationId, "123456");
+    assert.strictEqual(unsuspendedRecord.suspendedAt, null);
+    assert.ok(unsuspendedRecord.repositories.some(repo => repo.id === repositoryId));
     // Verify AuditLog
     const auditUnsuspended = await prisma.auditLog.findFirst({
       where: { orgId: org.id, action: "github.installation.unsuspended" }
@@ -473,7 +492,7 @@ async function runWebhookTests() {
     // Cleanup Database
     console.log("\nCleaning up database resources...");
     await prisma.gitHubInstallation.deleteMany({
-      where: { repositoryId: { in: [repositoryId, repositoryId2] } }
+      where: { installationId: "123456" }
     });
     await prisma.auditLog.deleteMany({
       where: { orgId: org.id }

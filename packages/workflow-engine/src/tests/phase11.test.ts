@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { getAffectedTables, runDatabaseCleanup } from "../diagnosticOrchestrator.js";
+import { getAffectedTables, runDatabaseCleanup } from "../workflowTypes.js";
 import { EndpointContract } from "@opspilot/schemas";
 
 export async function runPhase11Tests() {

@@ -1,14 +1,16 @@
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { prisma } from "@opspilot/database";
 import { logger, config } from "@opspilot/shared";
-import { WorkflowReplayer } from "./replay.js";
+import { WorkflowReplayer } from "@opspilot/workflow-core";
 import { RepairAttemptExecutor, RepairAttemptResult } from "./loop.js";
+import { applyUnifiedDiffs } from "./patchApplier.js";
+import { classifyVerification } from "./verifier.js";
 
 function runGit(args: string[], cwd: string): string {
   try {
-    return execSync(`git ${args.join(" ")}`, { cwd, encoding: "utf8", stdio: "pipe" });
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" });
   } catch (err: any) {
     throw new Error(`Git command failed: git ${args.join(" ")}. Error: ${err.message}. Output: ${err.stderr || err.stdout}`);
   }
@@ -22,7 +24,7 @@ function ensureGitRepo(repositoryRoot: string, logs: string[]): void {
     runGit(["config", "user.name", "OpsPilot"], repositoryRoot);
     runGit(["config", "user.email", "opspilot@local"], repositoryRoot);
     runGit(["add", "."], repositoryRoot);
-    runGit(["commit", "-m", '"initial snapshot commit"'], repositoryRoot);
+    runGit(["commit", "-m", "initial snapshot commit"], repositoryRoot);
     logs.push("Temporary Git repository initialized.");
   } else {
     try {
@@ -30,7 +32,7 @@ function ensureGitRepo(repositoryRoot: string, logs: string[]): void {
       if (status) {
         logs.push("Committing uncommitted changes in original repository to allow worktree creation...");
         runGit(["add", "."], repositoryRoot);
-        runGit(["commit", "-m", '"uncommitted changes backup"'], repositoryRoot);
+        runGit(["commit", "-m", "uncommitted changes backup"], repositoryRoot);
       }
     } catch (err: any) {
       logs.push(`Warning during git status/commit: ${err.message}`);
@@ -42,7 +44,7 @@ function ensureGitRepo(repositoryRoot: string, logs: string[]): void {
   } catch {
     logs.push("No commits found in Git repository. Creating initial commit...");
     runGit(["add", "."], repositoryRoot);
-    runGit(["commit", "-m", '"initial commit"'], repositoryRoot);
+    runGit(["commit", "-m", "initial commit"], repositoryRoot);
   }
 }
 
@@ -119,6 +121,7 @@ export class SandboxRepairAttemptExecutor implements RepairAttemptExecutor {
     let buildSuccess = false;
     let testSuccess = false;
     let replaySuccess = false;
+    let replaySkipped = false;
     let patchApplied = false;
     let securitySuccess = true;
     let worktreePath = "";
@@ -146,18 +149,7 @@ export class SandboxRepairAttemptExecutor implements RepairAttemptExecutor {
       });
 
       if (filesToPatch.length === 0) {
-        // Fallback: If no files in DB changeset, parse plan string for search/replace
-        if (plan.toLowerCase().includes("queue-name") || plan.toLowerCase().includes("queue") || plan.toLowerCase().includes("interviews")) {
-          const queueFile = path.join(originalRepositoryRoot, "src/queue.ts");
-          if (fs.existsSync(queueFile)) {
-            filesToPatch.push({
-              id: "fallback-queue-patch",
-              changeSetId: "fallback-cs",
-              path: "src/queue.ts",
-              diff: "interviews-queue -> interview-queue"
-            });
-          }
-        }
+        throw new Error("PATCH_UNAVAILABLE: remediation changeset has no unified diff files to apply.");
       }
 
       // Safety and Policy: Reject oversized changes
@@ -194,15 +186,7 @@ export class SandboxRepairAttemptExecutor implements RepairAttemptExecutor {
       fs.rmSync(worktreePath, { recursive: true, force: true });
 
       logs.push(`Creating temporary Git worktree at ${worktreePath}...`);
-      runGit(["worktree", "add", `"${worktreePath}"`], originalRepositoryRoot);
-
-      // Validate files relative to worktreePath (prevent path traversal)
-      for (const fileToPatch of filesToPatch) {
-        const fullPath = path.resolve(worktreePath, fileToPatch.path);
-        if (!fullPath.startsWith(worktreePath)) {
-          throw new Error(`Security error: path traversal attempt detected in patch path: ${fileToPatch.path}`);
-        }
-      }
+      runGit(["worktree", "add", worktreePath], originalRepositoryRoot);
 
       // 4. Update manifest to point to worktree
       workspaceJson.repositoryRoot = worktreePath;
@@ -210,30 +194,17 @@ export class SandboxRepairAttemptExecutor implements RepairAttemptExecutor {
       logs.push(`Workspace manifest updated to point repositoryRoot to worktree: ${worktreePath}`);
 
       // 5. Apply Diffs in the worktree
-      for (const fileToPatch of filesToPatch) {
-        const fullPath = path.resolve(worktreePath, fileToPatch.path);
-        if (!fs.existsSync(fullPath)) {
-          logs.push(`Warning: file not found to patch: ${fullPath}`);
-          continue;
-        }
-
-        const originalContent = fs.readFileSync(fullPath, "utf8");
-        let newContent = "";
-        if (fileToPatch.diff.includes("->")) {
-          // Simple search and replace
-          const parts = fileToPatch.diff.split("->");
-          const search = parts[0].trim();
-          const replace = parts[1].trim();
-          newContent = originalContent.replace(new RegExp(search, "g"), replace);
-        } else {
-          newContent = applyDiff(originalContent, fileToPatch.diff);
-        }
-
-        fs.writeFileSync(fullPath, newContent, "utf8");
-        changedFiles.push(fileToPatch.path);
-        patchApplied = true;
-        logs.push(`Successfully patched file in worktree: ${fileToPatch.path}`);
-      }
+      const applied = applyUnifiedDiffs(
+        worktreePath,
+        filesToPatch.map((file) => ({
+          path: file.path,
+          diff: file.diff,
+          originalHash: file.originalHash
+        }))
+      );
+      changedFiles.push(...applied.changedFiles);
+      patchApplied = changedFiles.length > 0;
+      logs.push(`Applied unified patch with git apply to ${changedFiles.length} file(s).`);
 
       // 6. Run Build in Sandbox
       logs.push("Running sandbox compilation build...");
@@ -286,15 +257,17 @@ export class SandboxRepairAttemptExecutor implements RepairAttemptExecutor {
           const apiEndpoint = runResult.endpoints?.find((e: any) => e.kind === "api" || e.kind === "application") || runResult.endpoints?.[0];
           const baseApiUrl = apiEndpoint ? apiEndpoint.externalUrl : "http://localhost:4000";
 
-          const { WorkflowDrivers } = await import("@opspilot/workflow-engine");
+          const { WorkflowDrivers } = await import("@opspilot/workflow-core");
           const replayer = new WorkflowReplayer(new WorkflowDrivers(baseApiUrl));
           const steps = workflow.steps as any[];
           
           const replayResult = await replayer.replay(steps, {
-            correlationId: workflowRun?.correlationId
+            correlationId: workflowRun?.correlationId,
+            workflowRunId: workflowRun?.id
           });
 
           replaySuccess = replayResult.success;
+          replaySkipped = false;
           logs.push(...replayResult.logs);
           logs.push(`Workflow replay: ${replaySuccess ? "SUCCESS" : "FAILED"}`);
 
@@ -310,8 +283,9 @@ export class SandboxRepairAttemptExecutor implements RepairAttemptExecutor {
             }
           }
         } else {
-          logs.push("Skipping workflow replay: Synthetic workflow steps not found.");
-          replaySuccess = true; // Assume success if no workflow steps to replay
+          logs.push("Workflow replay: SKIPPED because synthetic workflow steps were not found.");
+          replaySkipped = true;
+          replaySuccess = false;
         }
       }
 
@@ -334,7 +308,7 @@ export class SandboxRepairAttemptExecutor implements RepairAttemptExecutor {
       if (worktreePath && originalRepositoryRoot && fs.existsSync(worktreePath)) {
         try {
           logs.push(`Removing temporary Git worktree at ${worktreePath}...`);
-          runGit(["worktree", "remove", "--force", `"${worktreePath}"`], originalRepositoryRoot);
+          runGit(["worktree", "remove", "--force", worktreePath], originalRepositoryRoot);
           runGit(["worktree", "prune"], originalRepositoryRoot);
           fs.rmSync(worktreePath, { recursive: true, force: true });
           logs.push("Git worktree destroyed.");
@@ -344,12 +318,23 @@ export class SandboxRepairAttemptExecutor implements RepairAttemptExecutor {
       }
     }
 
+    const verification = classifyVerification({
+      buildSuccess,
+      testSuccess,
+      replaySuccess,
+      securitySuccess,
+      replaySkipped
+    });
+    logs.push(`Verification overall result: ${verification.overallResult}`);
+
     return {
       patchApplied,
       changedFiles,
       buildSuccess,
       testSuccess,
       replaySuccess,
+      replayStatus: verification.replayAfter,
+      overallResult: verification.overallResult,
       securitySuccess,
       logs
     };

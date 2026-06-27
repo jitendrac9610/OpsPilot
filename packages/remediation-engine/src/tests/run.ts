@@ -4,7 +4,7 @@ import { ChangeSetManager } from "../changesets.js";
 import { WorkflowReplayer } from "../replay.js";
 import { VerificationGates } from "../gates.js";
 import { AlternativeRepairLoop } from "../loop.js";
-import { WorkflowDrivers } from "@opspilot/workflow-engine";
+import { WorkflowDrivers } from "@opspilot/workflow-core";
 import { checkForFalseFixes, checkForSecurityIssues } from "../executor.js";
 
 async function runTests() {
@@ -38,12 +38,12 @@ async function runTests() {
     [{ action: "Add environment variable DB_HOST", file: ".env" }]
   );
   assert(planInfo.planId.startsWith("plan-"));
-  assert.strictEqual(planInfo.alternatives.length, 2);
+  assert.strictEqual(planInfo.alternatives.length, 3);
   console.log("✓ Plans created and scored.");
 
   console.log("\n2. Testing ChangeSet Creation...");
   const csInfo = await cm.createChangeSet(planInfo.planId, [
-    { path: ".env", diff: "+DB_HOST=localhost" }
+    { path: ".env", diff: "--- a/.env\n+++ b/.env\n@@ -0,0 +1 @@\n+DB_HOST=localhost" }
   ]);
   assert(csInfo.changeSetId.startsWith("cs-"));
   assert(csInfo.branchName.startsWith("opspilot-fix-"));

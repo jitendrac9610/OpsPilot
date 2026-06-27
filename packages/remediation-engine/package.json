@@ -2,8 +2,14 @@
   "name": "@opspilot/remediation-engine",
   "version": "1.0.0",
   "private": true,
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc",
     "test": "node dist/tests/run.js",
@@ -12,7 +18,9 @@
   "dependencies": {
     "@opspilot/shared": "workspace:*",
     "@opspilot/schemas": "workspace:*",
-    "@opspilot/database": "workspace:*"
+    "@opspilot/database": "workspace:*",
+    "@opspilot/workflow-core": "workspace:*",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "typescript": "^5.4.5",

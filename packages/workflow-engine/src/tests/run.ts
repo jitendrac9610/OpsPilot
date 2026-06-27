@@ -561,10 +561,6 @@ const razorpaySig = req.headers["x-razorpay-signature"];
 
   await fs.promises.rm(repositoryRoot, { recursive: true, force: true });
 
-  console.log("\nRunning Phase 7 Sandbox Hardening and Operational tests...");
-  const { runPhase7Tests } = await import("./phase7.test.js");
-  await runPhase7Tests();
-
   console.log("\nRunning Phase 8 WebSocket Automation tests...");
   const { runPhase8Tests } = await import("./phase8.test.js");
   await runPhase8Tests();

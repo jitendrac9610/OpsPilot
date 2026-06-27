@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { prisma } from "@opspilot/database";
-import { DiagnosticRunOrchestrator } from "../diagnosticOrchestrator.js";
+import { DiagnosticRunOrchestrator } from "../orchestrator.js";
 
 export async function runPhase7Tests() {
   console.log("=== Running Phase 7 Sandbox Hardening and Operational Tests ===");

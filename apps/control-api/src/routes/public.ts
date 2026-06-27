@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { prisma } from "@opspilot/database";
-import { ValidationError, ForbiddenError, logger } from "@opspilot/shared";
+import { createCommitSnapshot, resolveRemoteHeadSha } from "@opspilot/repository-intelligence";
+import { ValidationError, ForbiddenError } from "@opspilot/shared";
 
 const router = Router();
 
@@ -46,21 +47,22 @@ router.post("/repositories/:id/index", async (req: Request, res: Response, next:
       throw new ValidationError("Repository not found in organization");
     }
 
-    const mockWebhookUrl = `http://localhost:4001/webhooks/github`;
-    fetch(mockWebhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-github-event": "push"
-      },
-      body: JSON.stringify({
-        ref: `refs/heads/${repository.branch}`,
-        head_commit: { id: `public_api_trigger_${Date.now()}` },
-        repository: { id: repository.id, clone_url: repository.gitUrl }
-      })
-    }).catch(err => logger.error({ err }, "Failed to send manual push index trigger from public API"));
+    const commitSha = await resolveRemoteHeadSha(repository.gitUrl, repository.branch);
+    const snapshot = await createCommitSnapshot({
+      repositoryId: repository.id,
+      gitUrl: repository.gitUrl,
+      commitSha,
+      branch: repository.branch,
+      source: "public-api"
+    });
 
-    res.status(202).json({ status: "indexing_initiated", repositoryId: id });
+    res.status(202).json({
+      status: "indexing_initiated",
+      repositoryId: id,
+      snapshotId: snapshot.snapshotId,
+      commitSha,
+      archiveHash: snapshot.archiveHash
+    });
   } catch (err) {
     next(err);
   }

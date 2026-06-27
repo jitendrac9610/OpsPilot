@@ -6,12 +6,16 @@ export class GitHubClient {
   private privateKey: string;
 
   constructor() {
-    this.appId = config.github.appId || "mock_app_id";
-    this.privateKey = config.github.privateKey || "mock_private_key";
+    this.appId = config.github.appId;
+    this.privateKey = config.github.privateKey.replace(/\\n/g, "\n");
   }
 
   // Generates a short-lived JSON Web Token signed with the App private key
   private getAppJwt(): string {
+    if (!this.appId || !this.privateKey) {
+      throw new Error("GITHUB_APP_CREDENTIALS_MISSING: GitHub App ID and private key are required.");
+    }
+
     const now = Math.floor(Date.now() / 1000);
     const payload = {
       iat: now - 60, // Issued 60s ago to allow clock drift
@@ -19,18 +23,13 @@ export class GitHubClient {
       iss: this.appId
     };
 
-    try {
-      return jwt.sign(payload, this.privateKey, { algorithm: "RS256" });
-    } catch (err) {
-      logger.warn("Unable to sign JWT with GITHUB_PRIVATE_KEY. Falling back to mock token.");
-      return "mock_app_jwt_token";
-    }
+    return jwt.sign(payload, this.privateKey, { algorithm: "RS256" });
   }
 
   // Exchanges the App JWT for a short-lived installation access token
   async getInstallationToken(installationId: string): Promise<string> {
-    if (this.appId === "mock_app_id" || this.privateKey === "mock_private_key") {
-      logger.info({ installationId }, "Using mock installation token in development");
+    if ((!this.appId || !this.privateKey) && config.isDemoMode) {
+      logger.info({ installationId }, "Using demo GitHub installation token");
       return `mock_token_inst_${installationId}`;
     }
 
@@ -46,14 +45,15 @@ export class GitHubClient {
       });
 
       if (!res.ok) {
-        throw new Error(`GitHub token exchange failed: ${res.statusText}`);
+        const text = await res.text();
+        throw new Error(`GitHub token exchange failed: ${res.status} ${text || res.statusText}`);
       }
 
       const data = await res.json() as { token: string };
       return data.token;
     } catch (err) {
       logger.error({ err, installationId }, "Failed to fetch GitHub installation access token");
-      return `mock_token_inst_${installationId}`;
+      throw err;
     }
   }
 
@@ -68,6 +68,9 @@ export class GitHubClient {
     targetUrl?: string
   ): Promise<void> {
     if (token.startsWith("mock_")) {
+      if (!config.isDemoMode) {
+        throw new Error("GITHUB_MOCK_TOKEN_REJECTED: Mock GitHub tokens are allowed only in demo mode.");
+      }
       logger.info({ owner, repo, sha, state, description }, "Simulating GitHub status check update");
       return;
     }
@@ -90,10 +93,12 @@ export class GitHubClient {
       });
 
       if (!res.ok) {
-        logger.error({ status: res.status, owner, repo }, "Failed to update commit status");
+        const text = await res.text();
+        throw new Error(`GitHub status update failed: ${res.status} ${text || res.statusText}`);
       }
     } catch (err) {
       logger.error({ err, sha }, "Error updating commit status on GitHub");
+      throw err;
     }
   }
 
@@ -106,8 +111,11 @@ export class GitHubClient {
     body: string,
     head: string,
     base: string
-  ): Promise<{ number: number; url: string } | null> {
+  ): Promise<{ number: number; url: string }> {
     if (token.startsWith("mock_")) {
+      if (!config.isDemoMode) {
+        throw new Error("GITHUB_MOCK_TOKEN_REJECTED: Mock GitHub tokens are allowed only in demo mode.");
+      }
       logger.info({ owner, repo, title, head, base }, "Simulating pull request creation");
       return { number: 42, url: `https://github.com/${owner}/${repo}/pull/42` };
     }
@@ -125,15 +133,15 @@ export class GitHubClient {
       });
 
       if (!res.ok) {
-        logger.error({ status: res.status, owner, repo }, "Failed to create PR");
-        return null;
+        const text = await res.text();
+        throw new Error(`GitHub pull request creation failed: ${res.status} ${text || res.statusText}`);
       }
 
       const data = await res.json() as { number: number; html_url: string };
       return { number: data.number, url: data.html_url };
     } catch (err) {
       logger.error({ err, owner, repo }, "Error creating pull request on GitHub");
-      return null;
+      throw err;
     }
   }
 }

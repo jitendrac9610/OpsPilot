@@ -7,6 +7,8 @@ export interface RepairAttemptResult {
   buildSuccess: boolean;
   testSuccess: boolean;
   replaySuccess: boolean;
+  replayStatus?: "PASSED" | "FAILED" | "SKIPPED";
+  overallResult?: "PASSED" | "FAILED" | "INCONCLUSIVE";
   securitySuccess: boolean;
   logs: string[];
 }
@@ -62,6 +64,10 @@ export class AlternativeRepairLoop {
       }
       if (gatesConfig.checkSecurity && !result.securitySuccess) {
         finalLogs.push("SECURITY_REGRESSION_DETECTED");
+        continue;
+      }
+      if (gatesConfig.runReplay && result.replayStatus === "SKIPPED") {
+        finalLogs.push("WORKFLOW_REPLAY_SKIPPED_INCONCLUSIVE: missing replay evidence cannot satisfy verification gates.");
         continue;
       }
 

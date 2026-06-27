@@ -2,8 +2,8 @@
   "name": "@opspilot/repository-intelligence",
   "version": "1.0.0",
   "private": true,
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "clean": "tsc --build --clean"
@@ -12,10 +12,18 @@
     "@opspilot/database": "workspace:*",
     "@opspilot/shared": "workspace:*",
     "@opspilot/schemas": "workspace:*",
+    "archiver": "^7.0.1",
     "typescript": "^5.4.5"
   },
   "devDependencies": {
+    "@types/archiver": "^6.0.2",
     "typescript": "^5.4.5",
     "@types/node": "^20.12.12"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   }
 }

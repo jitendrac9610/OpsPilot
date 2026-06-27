@@ -40,6 +40,7 @@ model Organization {
   updatedAt   DateTime     @updatedAt
   memberships Membership[]
   projects    Project[]
+  githubInstallations GitHubInstallation[]
 }
 
 model Membership {
@@ -85,20 +86,28 @@ model Repository {
   gitUrl             String
   branch             String               @default("main")
   directory          String               @default("/")
+  githubRepositoryId String?              @unique
+  githubFullName     String?
+  githubInstallationId String?
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
   project            Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  githubInstallation GitHubInstallation?
+  githubInstallation GitHubInstallation?  @relation(fields: [githubInstallationId], references: [id], onDelete: SetNull)
   snapshots          RepositorySnapshot[]
   diagnosticRuns     DiagnosticRun[]
 }
 
 model GitHubInstallation {
-  id             String     @id @default(cuid())
-  repositoryId   String     @unique
-  installationId String
-  createdAt      DateTime   @default(now())
-  repository     Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  id             String       @id @default(cuid())
+  organizationId String
+  installationId String       @unique
+  accountLogin   String
+  accountType    String
+  permissions    Json
+  suspendedAt    DateTime?
+  createdAt      DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  repositories   Repository[]
 }
 
 model Integration {
@@ -177,11 +186,16 @@ model RepositorySnapshot {
   repositoryId   String
   commitSha      String
   archiveUrl     String
+  archiveHash    String          @default("")
+  source         String          @default("git")
+  status         String          @default("READY")
+  errorMessage   String?
   createdAt      DateTime        @default(now())
   repository     Repository      @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
   sandboxes      Sandbox[]
   diagnosticRuns DiagnosticRun[]
 
+  @@unique([repositoryId, commitSha])
   @@index([repositoryId, createdAt])
 }
 
@@ -193,6 +207,13 @@ model DiagnosticRun {
   snapshot           RepositorySnapshot? @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
   status             String              // PENDING, RUNNING, COMPLETED, FAILED, CANCELLED
   stage              String              // CLONING, DISCOVERING, INDEXING, SANDBOX_PROVISION, SANDBOX_START, BOOTSTRAP_AUTH, PLANNING_WORKFLOW, EXECUTING_WORKFLOW, LOCALIZING_FAILURE, FINISHED
+  attempt            Int                 @default(0)
+  progress           Int                 @default(0)
+  lastHeartbeatAt    DateTime?
+  workerId           String?
+  failureCode        String?
+  failureMessage     String?
+  retryable          Boolean             @default(false)
   discoveredServices Json?
   contracts          Json?
   workflows          Json?
@@ -201,6 +222,7 @@ model DiagnosticRun {
   artifacts          Json?
   rootCause          String?
   remediationStatus  String?
+  startedAt          DateTime?
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
   completedAt        DateTime?
@@ -637,6 +659,7 @@ model ChangeSetFile {
   changeSetId String
   path        String
   diff        String
+  originalHash String?
 }
 
 model VerificationPlan {
@@ -672,10 +695,14 @@ model RiskAssessment {
 model ApprovalRequest {
   id                String   @id @default(cuid())
   remediationPlanId String
-  status            String // PENDING, APPROVED, REJECTED
+  patchHash         String   @default("")
+  status            String // WAITING_FOR_APPROVAL, APPROVED, REJECTED
   requestedBy       String
   approvedBy        String?
+  approvalComment   String?
+  expiresAt         DateTime?
   createdAt         DateTime @default(now())
+  decidedAt         DateTime?
 }
 
 model ApprovedAction {

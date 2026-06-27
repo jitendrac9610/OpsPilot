@@ -1,11 +1,12 @@
 import { Router, Response, NextFunction } from "express";
 import { Queue } from "bullmq";
 import { prisma } from "@opspilot/database";
-import { config, ForbiddenError, ValidationError, logger } from "@opspilot/shared";
+import { config, ForbiddenError, OpsPilotError, ValidationError, logger } from "@opspilot/shared";
 import { authMiddleware, AuthenticatedRequest } from "../middleware/auth.js";
 
 const router = Router();
 router.use(authMiddleware);
+const DIAGNOSTIC_QUEUE_NAME = "diagnostic-runs";
 
 async function requireOwnedDiagnosticRun(req: AuthenticatedRequest, runId: string) {
   const run = await prisma.diagnosticRun.findUnique({
@@ -43,6 +44,7 @@ async function requireOwnedDiagnosticRun(req: AuthenticatedRequest, runId: strin
 }
 
 export async function enqueueDiagnosticRun(diagnosticRunId: string) {
+  let queue: Queue | undefined;
   try {
     const redisUrl = new URL(config.redisUrl);
     const connection = {
@@ -50,15 +52,53 @@ export async function enqueueDiagnosticRun(diagnosticRunId: string) {
       port: parseInt(redisUrl.port || "6379", 10),
       username: redisUrl.username || undefined,
       password: redisUrl.password || undefined,
-      db: parseInt(redisUrl.pathname.replace("/", "") || "0", 10)
+      db: parseInt(redisUrl.pathname.replace("/", "") || "0", 10),
+      connectTimeout: 5_000,
+      maxRetriesPerRequest: 1,
+      enableOfflineQueue: false
     };
 
-    const queue = new Queue("diagnostic-runs", { connection });
-    await queue.add("run-diagnosis", { diagnosticRunId });
-    await queue.close();
+    queue = new Queue(DIAGNOSTIC_QUEUE_NAME, { connection });
+    await queue.add(
+      "run-diagnosis",
+      { diagnosticRunId },
+      {
+        jobId: diagnosticRunId,
+        attempts: 3,
+        backoff: {
+          type: "exponential",
+          delay: 5000
+        },
+        removeOnComplete: 100,
+        removeOnFail: 500
+      }
+    );
     logger.info({ diagnosticRunId }, "Enqueued diagnostic run on BullMQ queue");
   } catch (err: any) {
-    logger.warn({ err: err.message, diagnosticRunId }, "Failed to enqueue diagnostic run to Redis/BullMQ. Running worker directly if possible.");
+    logger.error({ err: err.message, diagnosticRunId }, "Failed to enqueue diagnostic run to Redis/BullMQ");
+    await prisma.diagnosticRun.update({
+      where: { id: diagnosticRunId },
+      data: {
+        status: "FAILED",
+        stage: "FINISHED",
+        failureCode: "QUEUE_UNAVAILABLE",
+        failureMessage: "Diagnostic queue is unavailable. The run was not started.",
+        retryable: true,
+        completedAt: new Date()
+      }
+    }).catch((dbErr) => {
+      logger.error({ err: dbErr, diagnosticRunId }, "Failed to mark diagnostic run as queue-unavailable");
+    });
+    throw new OpsPilotError(
+      "Diagnostic queue is unavailable. Please retry when Redis/BullMQ is healthy.",
+      "QUEUE_UNAVAILABLE",
+      503,
+      { diagnosticRunId }
+    );
+  } finally {
+    await queue?.close().catch((closeErr) => {
+      logger.warn({ err: closeErr, diagnosticRunId }, "Failed to close diagnostic queue connection");
+    });
   }
 }
 
@@ -117,6 +157,9 @@ router.post("/:id/cancel", async (req: AuthenticatedRequest, res: Response, next
       where: { id: run.id },
       data: {
         status: "CANCELLED",
+        failureCode: "CANCELLED_BY_USER",
+        failureMessage: "Diagnostic run was cancelled by the user.",
+        retryable: false,
         completedAt: new Date()
       }
     });

@@ -29,6 +29,7 @@ async function triggerAgentInvestigation(
   environment = "production",
   timestamp = new Date()
 ) {
+  let agentQueue: Queue | undefined;
   try {
     const redisUrl = new URL(config.redisUrl);
     const connection = {
@@ -36,14 +37,17 @@ async function triggerAgentInvestigation(
       port: parseInt(redisUrl.port || "6379", 10),
       username: redisUrl.username || undefined,
       password: redisUrl.password || undefined,
-      db: parseInt(redisUrl.pathname.replace("/", "") || "0", 10)
+      db: parseInt(redisUrl.pathname.replace("/", "") || "0", 10),
+      connectTimeout: 5_000,
+      maxRetriesPerRequest: 1,
+      enableOfflineQueue: false
     };
 
-    const agentQueue = new Queue(QUEUE_NAME, { connection });
+    agentQueue = new Queue(QUEUE_NAME, { connection });
     
-    let snapshotId = "mock-snapshot-id";
+    let snapshotId: string | undefined;
     let commitSha = "latest";
-    let repositoryId = "mock-repository-id";
+    let repositoryId: string | undefined;
 
     if (serviceId) {
       const service = await prisma.service.findUnique({
@@ -103,7 +107,7 @@ async function triggerAgentInvestigation(
       }
     }
 
-    if (snapshotId === "mock-snapshot-id") {
+    if (!snapshotId) {
       // Fallback: fetch a default snapshotId to link the agent run to code, if it exists
       const latestSnapshot = await prisma.repositorySnapshot.findFirst({
         orderBy: { createdAt: "desc" }
@@ -113,6 +117,20 @@ async function triggerAgentInvestigation(
         repositoryId = latestSnapshot.repositoryId;
         commitSha = latestSnapshot.commitSha;
       }
+    }
+
+    if (!snapshotId) {
+      logger.warn({ incidentId, serviceId }, "No real repository snapshot available; skipping agent investigation enqueue.");
+      await prisma.incidentEvent.create({
+        data: {
+          incidentId,
+          type: "AGENT_SKIPPED_NO_SNAPSHOT",
+          message: "OpsPilot could not resolve a repository snapshot for this incident, so no agent job was queued."
+        }
+      }).catch((dbErr) => {
+        logger.warn({ err: dbErr, incidentId }, "Failed to record skipped agent investigation event");
+      });
+      return;
     }
 
     const job = await agentQueue.add("investigate-incident", {
@@ -125,7 +143,20 @@ async function triggerAgentInvestigation(
 
     logger.info({ jobId: job.id, incidentId, snapshotId, commitSha, environment, serviceId }, "Enqueued AI Agent investigation job on BullMQ queue");
   } catch (err: any) {
-    logger.warn({ err: err.message, incidentId }, "Redis/BullMQ not available. Incident Worker skipping agent job enqueuing.");
+    logger.error({ err: err.message, incidentId }, "Redis/BullMQ not available. Incident Worker could not enqueue agent job.");
+    await prisma.incidentEvent.create({
+      data: {
+        incidentId,
+        type: "AGENT_QUEUE_UNAVAILABLE",
+        message: "Redis/BullMQ was unavailable, so OpsPilot could not enqueue the agent investigation."
+      }
+    }).catch((dbErr) => {
+      logger.warn({ err: dbErr, incidentId }, "Failed to record queue-unavailable incident event");
+    });
+  } finally {
+    await agentQueue?.close().catch((closeErr) => {
+      logger.warn({ err: closeErr, incidentId }, "Failed to close incident agent queue connection");
+    });
   }
 }
 

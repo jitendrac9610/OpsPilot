@@ -8,6 +8,7 @@
     "declarationMap": true,
     "sourceMap": true,
     "composite": true,
+    "tsBuildInfoFile": "${configDir}/dist/tsconfig.tsbuildinfo",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,

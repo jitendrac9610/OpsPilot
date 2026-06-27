@@ -1,17 +1,41 @@
 import { prisma } from "@opspilot/database";
+import { createCommitSnapshot } from "@opspilot/repository-intelligence";
 import { logger, config, storage } from "@opspilot/shared";
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import crypto from "node:crypto";
 import { EvidenceEvent } from "@opspilot/schemas";
-import { WorkflowDiscoverer } from "./discovery.js";
-import { StatefulWorkflowPlanner } from "./statefulPlanner.js";
-import { AuthBootstrapper } from "./authBootstrapper.js";
-import { WorkflowDrivers } from "./drivers.js";
-import { AssertionEngine } from "./assertions.js";
-import { FailureLocalizer } from "./localization.js";
-import { CorrelationManager } from "./correlation.js";
+import {
+  AuthBootstrapper,
+  FailureLocalizer,
+  StatefulWorkflowPlanner,
+  WorkflowDiscoverer
+} from "@opspilot/workflow-engine";
+import {
+  AssertionEngine,
+  CorrelationManager,
+  WorkflowDrivers,
+  getAffectedTables,
+  runDatabaseCleanup
+} from "@opspilot/workflow-core";
+import { DiagnosticWorkerError } from "./errors.js";
+import { progressForStage } from "./heartbeat.js";
+
+class UnsupportedWorkflowStepError extends Error {
+  public readonly code = "UNSUPPORTED_WORKFLOW_STEP";
+
+  constructor(public readonly stepType: string) {
+    super(`Unsupported workflow step type: ${stepType}`);
+    this.name = "UnsupportedWorkflowStepError";
+  }
+}
+
+export interface DiagnosticRunOrchestratorOptions {
+  signal?: AbortSignal;
+  attempt?: number;
+  workerId?: string;
+}
 
 export async function getRemoteHeadSha(gitUrl: string, branch: string): Promise<string> {
   if (gitUrl.startsWith("mock_") || gitUrl.includes("mock-repo")) {
@@ -44,12 +68,14 @@ export async function getRemoteHeadSha(gitUrl: string, branch: string): Promise<
 
 export class DiagnosticRunOrchestrator {
   private id: string;
+  private options: DiagnosticRunOrchestratorOptions = {};
 
   constructor(id: string) {
     this.id = id;
   }
 
-  async run(): Promise<void> {
+  async run(options: DiagnosticRunOrchestratorOptions = {}): Promise<void> {
+    this.options = options;
     logger.info({ diagnosticRunId: this.id }, "Starting DiagnosticRun orchestrator");
 
     // Fetch the run
@@ -77,7 +103,18 @@ export class DiagnosticRunOrchestrator {
     if (run.status === "PENDING") {
       run = await prisma.diagnosticRun.update({
         where: { id: this.id },
-        data: { status: "RUNNING", stage: "CLONING" },
+        data: {
+          status: "RUNNING",
+          stage: "CLONING",
+          attempt: options.attempt ?? run.attempt + 1,
+          workerId: options.workerId,
+          startedAt: run.startedAt ?? new Date(),
+          lastHeartbeatAt: new Date(),
+          progress: progressForStage("CLONING"),
+          failureCode: null,
+          failureMessage: null,
+          retryable: false
+        },
         include: { repository: true }
       });
     }
@@ -95,7 +132,7 @@ export class DiagnosticRunOrchestrator {
       let newEndpoints: any[] = [];
       let newServices: any[] = [];
       try {
-        const checkRes = await fetch(`${config.services.sandboxControllerUrl}/api/sandboxes/${sandboxId}/services`);
+        const checkRes = await this.fetch(`${config.services.sandboxControllerUrl}/api/sandboxes/${sandboxId}/services`);
         if (checkRes.ok) {
           const body = await checkRes.json() as any;
           if (body.success && Array.isArray(body.services) && body.services.length > 0) {
@@ -111,7 +148,7 @@ export class DiagnosticRunOrchestrator {
       if (!servicesActive) {
         logger.info({ diagnosticRunId: this.id }, "Sandbox services are inactive. Attempting self-healing recovery.");
         try {
-          const runRes = await fetch(`${config.services.sandboxControllerUrl}/api/sandboxes/${sandboxId}/run`, {
+          const runRes = await this.fetch(`${config.services.sandboxControllerUrl}/api/sandboxes/${sandboxId}/run`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ environment: {} })
@@ -181,39 +218,20 @@ export class DiagnosticRunOrchestrator {
           where: { repositoryId: repo.id, commitSha }
         });
 
-        if (!snapshot) {
-          // Trigger github-worker to create snapshot
-          logger.info({ repoId: repo.id, commitSha }, "Snapshot not found. Triggering github-worker archiving.");
-          const mockWebhookUrl = `http://localhost:4001/webhooks/github`;
-          const response = await fetch(mockWebhookUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-github-event": "push"
-            },
-            body: JSON.stringify({
-              ref: `refs/heads/${repo.branch}`,
-              head_commit: { id: commitSha },
-              repository: { id: repo.id, clone_url: repo.gitUrl }
-            })
+        if (!snapshot || snapshot.status !== "READY") {
+          logger.info({ repoId: repo.id, commitSha }, "Snapshot not found. Creating exact commit snapshot.");
+          const snapshotResult = await createCommitSnapshot({
+            repositoryId: repo.id,
+            gitUrl: repo.gitUrl,
+            commitSha,
+            branch: repo.branch,
+            source: "diagnostic-worker"
           });
-
-          if (!response.ok) {
-            throw new Error(`Failed to trigger github-worker webhook: ${response.statusText}`);
-          }
-
-          // Poll for snapshot creation (up to 90 seconds)
-          let attempts = 0;
-          while (!snapshot && attempts < 90) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            snapshot = await prisma.repositorySnapshot.findFirst({
-              where: { repositoryId: repo.id, commitSha }
-            });
-            attempts++;
-          }
-
-          if (!snapshot) {
-            throw new Error(`Timed out waiting for repository snapshot creation for commit ${commitSha}`);
+          snapshot = await prisma.repositorySnapshot.findUnique({
+            where: { id: snapshotResult.snapshotId }
+          });
+          if (!snapshot || snapshot.status !== "READY") {
+            throw new Error(`Repository snapshot creation failed for commit ${commitSha}`);
           }
         }
 
@@ -249,7 +267,7 @@ export class DiagnosticRunOrchestrator {
 
         if (!capProfile) {
           logger.info({ snapshotId }, "Triggering discovery worker...");
-          const discRes = await fetch(`${config.services.discoveryWorkerUrl}/discover`, {
+          const discRes = await this.fetch(`${config.services.discoveryWorkerUrl}/discover`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -266,7 +284,7 @@ export class DiagnosticRunOrchestrator {
           // wait a brief moment for DB to commit capability profile
           let attempts = 0;
           while (!capProfile && attempts < 10) {
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await this.sleep(500);
             capProfile = await prisma.capabilityProfile.findUnique({ where: { snapshotId } });
             attempts++;
           }
@@ -304,7 +322,7 @@ export class DiagnosticRunOrchestrator {
         let attempts = 0;
         // Wait up to 60 seconds for indexing to finish asynchronously
         while (!archVersion && attempts < 60) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await this.sleep(1000);
           archVersion = await prisma.architectureVersion.findFirst({
             where: { snapshotId }
           });
@@ -346,7 +364,7 @@ export class DiagnosticRunOrchestrator {
 
         if (!sandboxId) {
           logger.info({ snapshotId }, "Allocating sandbox for diagnosis");
-          const sandboxRes = await fetch(`${config.services.sandboxControllerUrl}/api/sandboxes`, {
+          const sandboxRes = await this.fetch(`${config.services.sandboxControllerUrl}/api/sandboxes`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ snapshotId })
@@ -384,7 +402,7 @@ export class DiagnosticRunOrchestrator {
         if (!sandboxId) throw new Error("Missing sandboxId to start services");
 
         logger.info({ sandboxId }, "Starting sandbox container services");
-        const runRes = await fetch(`${config.services.sandboxControllerUrl}/api/sandboxes/${sandboxId}/run`, {
+        const runRes = await this.fetch(`${config.services.sandboxControllerUrl}/api/sandboxes/${sandboxId}/run`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ environment: {} })
@@ -564,22 +582,7 @@ export class DiagnosticRunOrchestrator {
         }
 
         const drivers = new WorkflowDrivers(baseApiUrl);
-        const assertionEngine = new AssertionEngine({
-          database: async (cfg) => {
-            return {
-              success: true,
-              log: `DATABASE_ASSERTION_PASSED: Verified DB state for ${cfg.table}.`,
-              evidence: { table: cfg.table, success: true }
-            };
-          },
-          queue: async (cfg) => {
-            return {
-              success: true,
-              log: `QUEUE_ASSERTION_PASSED: Found BullMQ job in ${cfg.queueName}.`,
-              evidence: { queueName: cfg.queueName, success: true }
-            };
-          }
-        });
+        const assertionEngine = new AssertionEngine();
 
         // Prepare variables
         const variables: Record<string, any> = { ...(plan.initialVariables || {}) };
@@ -661,10 +664,13 @@ export class DiagnosticRunOrchestrator {
           const stepStart = Date.now();
           const configWithVars = interpolate(step.config || {});
           configWithVars.correlationId = correlationId;
+          configWithVars.workflowRunId = workflowRunId;
+          configWithVars.stepId = step.id;
           
           let stepSuccess = false;
           let stepLog = "";
           let stepError = "";
+          let stepStatus: "COMPLETED" | "FAILED" | "UNSUPPORTED" = "FAILED";
           let responseBody: any = null;
 
           try {
@@ -711,7 +717,7 @@ export class DiagnosticRunOrchestrator {
                 if (lastRes.success) {
                   break;
                 }
-                await new Promise((resolve) => setTimeout(resolve, interval));
+                await this.sleep(interval);
               }
               stepSuccess = lastRes.success;
               stepLog = lastRes.log;
@@ -719,12 +725,15 @@ export class DiagnosticRunOrchestrator {
                 stepError = `Queue job assertion failed: ${lastRes.log}`;
               }
             } else {
-              stepSuccess = true;
-              stepLog = `Skipped unknown step type: ${step.type}`;
+              throw new UnsupportedWorkflowStepError(step.type);
             }
+            stepStatus = stepSuccess ? "COMPLETED" : "FAILED";
           } catch (err: any) {
             stepSuccess = false;
-            stepLog = `Step execution exception: ${err.message}`;
+            stepStatus = err instanceof UnsupportedWorkflowStepError ? "UNSUPPORTED" : "FAILED";
+            stepLog = err instanceof UnsupportedWorkflowStepError
+              ? err.message
+              : `Step execution exception: ${err.message}`;
             stepError = err.message;
           }
 
@@ -732,7 +741,7 @@ export class DiagnosticRunOrchestrator {
           await correlationManager.recordStepRun(
             workflowRunId,
             step.id,
-            stepSuccess ? "COMPLETED" : "FAILED",
+            stepStatus,
             [stepLog],
             stepError || undefined
           );
@@ -799,7 +808,7 @@ export class DiagnosticRunOrchestrator {
             stepId: step.id,
             name: step.name,
             type: step.type,
-            status: stepSuccess ? "COMPLETED" : "FAILED",
+            status: stepStatus,
             log: stepLog,
             error: stepError || null
           });
@@ -884,6 +893,10 @@ export class DiagnosticRunOrchestrator {
             data: {
               status: "COMPLETED",
               stage: "FINISHED",
+              progress: 100,
+              failureCode: null,
+              failureMessage: null,
+              retryable: false,
               completedAt: new Date()
             }
           });
@@ -931,7 +944,7 @@ export class DiagnosticRunOrchestrator {
 
         // Generate Remediation Plan and ChangeSet
         logger.info({ rootCause }, "Generating remediation plan");
-        const { RemediationPlanManager, ChangeSetManager, AlternativeRepairLoop, SandboxRepairAttemptExecutor } = await import("@opspilot/remediation-engine");
+        const { RemediationPlanManager, ChangeSetManager } = await import("@opspilot/remediation-engine");
 
         const planManager = new RemediationPlanManager(false);
         const changesetManager = new ChangeSetManager(false);
@@ -943,39 +956,15 @@ export class DiagnosticRunOrchestrator {
           [{ action: "Apply code corrections", file: "src/queue.ts" }]
         );
 
-        let filesToPatch: { path: string; diff: string }[] = [];
-        if (rootCause.toLowerCase().includes("queue-name mismatch") || rootCause.toLowerCase().includes("queue")) {
-          filesToPatch.push({ path: "src/queue.ts", diff: "interviews-queue -> interview-queue" });
-        } else if (rootCause.toLowerCase().includes("event-name mismatch") || rootCause.toLowerCase().includes("inngest")) {
-          filesToPatch.push({ path: "src/inngest.ts", diff: "interviews.created -> interview.created" });
-        } else if (rootCause.toLowerCase().includes("stripe") || rootCause.toLowerCase().includes("signature")) {
-          filesToPatch.push({ path: "src/stripe.ts", diff: "req.body -> req.rawBody || req.body" });
-        } else if (rootCause.toLowerCase().includes("clerk")) {
-          filesToPatch.push({ path: "src/clerk.ts", diff: "authHeader -> authHeader.replace(\"Bearer \", \"\")" });
-        } else {
-          filesToPatch.push({ path: "src/queue.ts", diff: "interviews-queue -> interview-queue" });
-        }
+        await changesetManager.createChangeSet(planInfo.planId, []);
 
-        await changesetManager.createChangeSet(planInfo.planId, filesToPatch);
-
-        // Run Verification Loop
-        logger.info({ planId: planInfo.planId }, "Executing remediation repair loop");
-        const repairExecutor = new SandboxRepairAttemptExecutor(sandboxId, planInfo.planId);
-        const repairLoop = new AlternativeRepairLoop(repairExecutor);
-
-        const gatesConfig = {
-          runBuild: true,
-          runTests: true,
-          runReplay: true,
-          checkSecurity: true
+        const loopRes = {
+          success: false,
+          attemptCount: 0,
+          finalLogs: [
+            "PATCH_PROPOSAL_REQUIRED: no validated unified-diff patch proposal was generated for this diagnosis."
+          ]
         };
-
-        const loopRes = await repairLoop.runRepairLoop(
-          planInfo.planId,
-          gatesConfig,
-          planInfo.alternatives,
-          3
-        );
 
         logger.info({ loopRes }, "Remediation loop execution finished");
 
@@ -987,7 +976,10 @@ export class DiagnosticRunOrchestrator {
             status: "FAILED",
             stage: "FINISHED",
             rootCause: rootCause,
-            remediationStatus: loopRes.success ? "SUCCEEDED" : "FAILED",
+            remediationStatus: loopRes.success ? "SUCCEEDED" : "PATCH_PROPOSAL_REQUIRED",
+            failureCode: loopRes.success ? "APPLICATION_FAILURE_REPAIRED" : "PATCH_PROPOSAL_REQUIRED",
+            failureMessage: rootCause,
+            retryable: false,
             completedAt: new Date()
           }
         });
@@ -1000,12 +992,55 @@ export class DiagnosticRunOrchestrator {
             status: "FAILED",
             stage: "FINISHED",
             rootCause: `Remediation / Localization failed: ${err.message}. Original failure: ${stepFailureReason || artifacts.stepFailureReason}`,
+            failureCode: "LOCALIZATION_OR_REMEDIATION_FAILED",
+            failureMessage: err.message,
+            retryable: false,
             completedAt: new Date()
           }
         });
         await this.recordUsageMetrics(completedRun);
       }
     }
+  }
+
+  private assertNotAborted(): void {
+    if (this.options.signal?.aborted) {
+      throw new DiagnosticWorkerError(
+        "DIAGNOSTIC_RUN_CANCELLED",
+        "Diagnostic run was cancelled.",
+        false
+      );
+    }
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    this.assertNotAborted();
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(resolve, ms);
+      const abort = () => {
+        clearTimeout(timeout);
+        reject(new DiagnosticWorkerError(
+          "DIAGNOSTIC_RUN_CANCELLED",
+          "Diagnostic run was cancelled.",
+          false
+        ));
+      };
+
+      if (this.options.signal?.aborted) {
+        abort();
+        return;
+      }
+
+      this.options.signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  private async fetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+    this.assertNotAborted();
+    return fetch(input, {
+      ...init,
+      signal: this.options.signal ?? init.signal
+    });
   }
 
   private async fail(reason: string, failedStage: string): Promise<void> {
@@ -1028,6 +1063,9 @@ export class DiagnosticRunOrchestrator {
         status: "FAILED",
         stage: "FINISHED",
         rootCause: `Failed in stage ${failedStage}: ${reason}`,
+        failureCode: `STAGE_${failedStage}_FAILED`.replace(/[^A-Z0-9_]/g, "_"),
+        failureMessage: reason,
+        retryable: false,
         completedAt: new Date()
       }
     });
@@ -1050,6 +1088,26 @@ export class DiagnosticRunOrchestrator {
   }
 
   private async checkCancelled(sandboxId?: string): Promise<boolean> {
+    if (this.options.signal?.aborted) {
+      logger.info({ diagnosticRunId: this.id }, "DiagnosticRun cancellation signal detected. Cleaning up resources.");
+      if (sandboxId) {
+        await this.cleanupSandbox(sandboxId);
+      }
+      await prisma.diagnosticRun.update({
+        where: { id: this.id },
+        data: {
+          status: "CANCELLED",
+          failureCode: "CANCELLED_BY_USER",
+          failureMessage: "Diagnostic run was cancelled while the worker was running.",
+          retryable: false,
+          completedAt: new Date()
+        }
+      }).catch((err) => {
+        logger.warn({ err, diagnosticRunId: this.id }, "Failed to persist signal cancellation state");
+      });
+      return true;
+    }
+
     const current = await prisma.diagnosticRun.findUnique({
       where: { id: this.id },
       select: { status: true, artifacts: true }
@@ -1099,67 +1157,6 @@ export class DiagnosticRunOrchestrator {
       }
     } catch (err: any) {
       logger.warn({ err: err.message }, "Failed to record sandbox usage metrics");
-    }
-  }
-}
-
-export function getAffectedTables(plan: any, contracts: any[]): string[] {
-  const affectedTables = new Set<string>();
-  if (plan && Array.isArray(plan.steps)) {
-    for (const step of plan.steps) {
-      if (step.config?.contractId) {
-        const contract = contracts.find(c => c.id === step.config.contractId);
-        if (contract) {
-          if (Array.isArray(contract.prisma) && contract.prisma.length > 0) {
-            for (const p of contract.prisma) {
-              if (p.model) affectedTables.add(p.model);
-            }
-          } else {
-            const pathSegments = contract.path.split("/").filter(Boolean);
-            const resource = pathSegments.find((s: string) => !s.startsWith(":") && !s.startsWith("{") && s !== "api" && s !== "v1");
-            if (resource) affectedTables.add(resource);
-          }
-        }
-      }
-    }
-  }
-  if (affectedTables.size === 0) {
-    affectedTables.add("User");
-  }
-  return [...affectedTables];
-}
-
-export async function runDatabaseCleanup(
-  assertionEngine: any,
-  affectedTables: string[],
-  variables: Record<string, any>
-): Promise<void> {
-  logger.info({ affectedTables }, "Starting database cleanup for affected tables");
-  for (const table of affectedTables) {
-    const candidates = [
-      `${table.toLowerCase()}s.id`,
-      `${table.toLowerCase()}.id`,
-      `${table}.id`
-    ];
-    let foundId: any = undefined;
-    for (const candidate of candidates) {
-      if (variables[candidate]) {
-        foundId = variables[candidate];
-        break;
-      }
-    }
-
-    if (foundId) {
-      logger.info({ table, id: foundId }, "Cleaning up generated database record");
-      try {
-        await assertionEngine.assertDBState({
-          action: "cleanup",
-          table,
-          whereClause: { id: foundId }
-        });
-      } catch (err: any) {
-        logger.warn({ table, id: foundId, err: err.message }, "Database cleanup action failed");
-      }
     }
   }
 }
